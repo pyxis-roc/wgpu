@@ -263,6 +263,9 @@ pub mod proc;
 mod span;
 pub mod valid;
 
+#[cfg(feature = "abc")]
+pub mod bounds;
+
 pub use crate::arena::{Arena, Handle, Range, UniqueArena};
 
 pub use crate::span::{SourceLocation, Span, SpanContext, WithSpan};

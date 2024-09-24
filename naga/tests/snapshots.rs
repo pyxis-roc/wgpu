@@ -99,7 +99,7 @@ struct Parameters {
 
 /// Information about a shader input file.
 #[derive(Debug)]
-struct Input {
+pub(crate) struct Input {
     /// The subdirectory of `tests/in` to which this input belongs, if any.
     ///
     /// If the subdirectory is omitted, we assume that the output goes
@@ -127,7 +127,7 @@ impl Input {
     /// The `input` path is interpreted relative to the `BASE_DIR_IN`
     /// subdirectory of the directory given by the `CARGO_MANIFEST_DIR`
     /// environment variable.
-    fn new(subdirectory: Option<&str>, name: &str, extension: &str) -> Input {
+    pub(crate) fn new(subdirectory: Option<&str>, name: &str, extension: &str) -> Input {
         Input {
             subdirectory: subdirectory.map(PathBuf::from),
             // Don't wipe out any extensions on `name`, as
@@ -204,7 +204,7 @@ impl Input {
     }
 
     /// Return the contents of the input file as a string.
-    fn read_source(&self) -> String {
+    pub(crate) fn read_source(&self) -> String {
         println!("Processing '{}'", self.file_name.display());
         let input_path = self.input_path();
         match fs::read_to_string(&input_path) {
