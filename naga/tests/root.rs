@@ -1,3 +1,4 @@
+mod bounds;
 mod example_wgsl;
 mod snapshots;
 mod spirv_capabilities;
