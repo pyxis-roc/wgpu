@@ -636,10 +636,14 @@ impl BoundsChecker {
                     AbcExpression::new_literal(0).into(),
                     &format!("{}[{}]", base_expr, &index),
                 )?;
+                let len_expression = self
+                    .helper
+                    .add_expression(AbcExpression::ArrayLength(base_expr.clone()))?;
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
-                    AbcExpression::new_var(self.global_vars[0].clone()).into(),
+                    // todo: fix this.
+                    len_expression,
                     &format!("{}[{}]", base_expr, index),
                 )?;
                 Ok(res)
@@ -727,7 +731,12 @@ impl BoundsChecker {
             // A 'load' should get the most recent variable name of the expression it is loading from...
             Expr::Load { pointer } => {
                 info!("Load expression: {:?}", func_ctx.func.expressions[*pointer]);
-                return self.visit_expr(module_info, *pointer, func_ctx, func_summary);
+                // We will make a new expression holding the value of the thing being loaded from...
+                let loaded = self.visit_expr(module_info, *pointer, func_ctx, func_summary);
+                AbcExpression::new_var(abc_helper::Var {
+                    name: self.expr_to_name(*pointer, func_ctx.func),
+                })
+                // When we load, we should use the last SSA variable name.
             }
             Expr::FunctionArgument(idx) => {
                 let var = func_summary.arguments[*idx as usize].clone();
@@ -785,7 +794,12 @@ impl BoundsChecker {
                     r#""As" expressions"#.to_string(),
                 ));
             }
-            Expr::GlobalVariable(g) => self[*g].clone().into(),
+            Expr::GlobalVariable(g) => {
+                // Get the last ssa counter for the global variable reference?
+                // No, honestly, we probably need to mark this.
+                // Use the last counter for the global variable...
+                self[*g].clone().into()
+            }
             Expr::LocalVariable(l) => {
                 let var = func_summary[*l].clone();
                 AbcExpression::new_var(var)
@@ -899,6 +913,8 @@ impl BoundsChecker {
                 }
                 Statement::Return { value: None } => {
                     self.helper.mark_return(None)?;
+                    // When we get to a return, we stop processing all statements in the block.
+                    return Ok(());
                 }
                 Statement::If {
                     condition,
@@ -1179,11 +1195,12 @@ impl BoundsChecker {
         }
 
         // Entry points contain function summaries.
-        // Here we have constraints over, well, what do we have constraints over again?
-        for fun in module.entry_points.iter() {
-            let new_summary = self.check_function(&ModuleWithInfo { module, info }, fun)?;
-            self.entry_points.push(new_summary);
-        }
+        // for ep in module.entry_points.iter() {
+        //     let new_summary = self.check_function(&ModuleWithInfo { module, info }, ep.function)?;
+        //     // I must be able to mark additional constraints within the function.
+        //     // E.g., the arguments to the function must correspond to
+        //     self.entry_points.push(new_summary);
+        // }
 
         Ok(())
     }
