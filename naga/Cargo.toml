@@ -84,7 +84,7 @@ petgraph = { version = "0.6", optional = true }
 pp-rs = { version = "0.2.1", optional = true }
 hexf-parse = { version = "0.2.1", optional = true }
 unicode-xid = { version = "0.2.6", optional = true }
-abc-helper = { git = "ssh://git@github.com/pyxis-roc/wgpu-abc-helper.git", optional = true}
+abc-helper = { git = "ssh://git@github.com/pyxis-roc/wgpu-abc-helper.git", optional = true, branch="main" }
 
 [build-dependencies]
 cfg_aliases.workspace = true
@@ -104,3 +104,6 @@ ron = "0.8.0"
 rspirv = { version = "0.11", git = "https://github.com/gfx-rs/rspirv", rev = "b969f175d5663258b4891e44b76c1544da9661ab" }
 serde = { workspace = true, features = ["derive"] }
 spirv = { version = "0.3", features = ["deserialize"] }
+
+[net]
+git-fetch-with-cli = true
