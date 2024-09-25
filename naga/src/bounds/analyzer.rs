@@ -14,58 +14,31 @@ use std::{collections::HashMap, fmt::Debug, ops};
 
 use super::helper_interface::{self, HasName, HasType};
 
-use crate::{arena::BadHandle, valid::ModuleInfo, ArraySize, FastHashMap, GlobalVariable, Module};
-use abc_helper::{self, AbcExpression, AbcScalar, AbcType, ConstraintInterface};
-use log::{info, warn};
+use crate::{
+    arena::BadHandle, valid::ModuleInfo, ArraySize, FastHashMap, FunctionArgument, GlobalVariable,
+    Module,
+};
+use abc_helper::{self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, Predicate, Term};
+use log::info as log_info;
 use rustc_hash::FxHashMap;
-/// We need a cache for expressions that we have already transformed into naga expressions...
 
-// impl crate::Expression {
-//     fn to_abc_expression(self, ExprArena: crate::Arena<crate::Expression>, GlobalArena: crate::Arena<GlobalVariable>) {
-//         match
-//     }
-// }
 
-// // We can't actually do this because expressions refer to handles!!
-// impl From<crate::Expression> for AbcExpression {
-//     fn from(value: crate::Expression) -> Self {
-//         match value {
-//             crate::Expression::Access { base, index } =>
-//         }
-//     }
-// }
-
-// helper macros...
-// Helper struct for passing around module info
-
+/// Convenience struct used to pass around a module with its info together in one term.
 #[derive(Clone, Copy)]
 struct ModuleWithInfo<'a> {
     module: &'a Module,
     info: &'a ModuleInfo,
 }
 
-// impl From<(Module, ModuleInfo)> for ModuleWithInfo<'_> {
-//     fn from((module, info): (Module, ModuleInfo)) -> Self {
-//         ModuleWithInfo {
-//             module: &module,
-//             info: &info,
-//         }
-//     }
-// }
 
-/// Just a helper struct to simplify passing around functions with their info.
+/// Convenience struct used to pass around a function with its info together in one term.
 struct FunctionWithInfo<'a> {
-    handle: crate::Handle<crate::Function>,
     func: &'a crate::Function,
     info: &'a crate::valid::FunctionInfo,
 }
 
-struct ExpressionWithInfo<'a> {
-    handle: crate::Handle<crate::Expression>,
-    expr: &'a crate::Expression,
-    info: &'a crate::valid::ExpressionInfo,
-}
 
+/// Macro used only for debugging purposes that prints the variant of an expression.
 #[allow(unused_macros)]
 macro_rules! expression_variant {
     ($expr:expr) => {
@@ -108,6 +81,7 @@ macro_rules! expression_variant {
     };
 }
 
+/// Macro used only for debugging purposes that prints the variant of a statement.
 #[allow(unused_macros)]
 macro_rules! statement_variant {
     ($expr:expr) => {
@@ -137,26 +111,39 @@ macro_rules! statement_variant {
         }
     };
 }
-// Simplify the type of a handle
 
+/// Type alias for the handle type used in the AbcHelper
 type ConstraintHandle<T> = <abc_helper::ConstraintHelper as ConstraintInterface>::Handle<T>;
 
+
+/// The bounds checker acts acts as the Bridge between a [`Module`] and the Constraint Helper.
+/// 
+/// This struct can be referenced, similarly to [`ModuleInfo`], to get the bounds requirements for the functions in the module.
+/// 
+/// To populate the bounds information, call [`abc_impl`]
+/// 
+/// 
+/// [`Module`]: crate::Module
+/// [`ModuleInfo`]: crate::ModuleInfo
+/// [`abc_impl`]: BoundsChecker::abc_impl
 #[derive(Default)]
 pub struct BoundsChecker {
     // Arena of vars we have...
     pub helper: abc_helper::ConstraintHelper,
-    pub global_vars: Vec<ConstraintHandle<abc_helper::Var>>,
+
+    pub global_vars: Vec<Term>,
     // Global expressions for the main module...
-    pub global_exprs:
-        FastHashMap<crate::Handle<crate::Expression>, ConstraintHandle<AbcExpression>>,
+    pub global_exprs: FastHashMap<crate::Handle<crate::Expression>, Term>,
     // Functions in the scope...
     pub functions: Vec<FunctionSummary>,
 
+    /// Entry points are unique in that there is no handle to the contained function.
+    /// They are always indexed by their position in the entry point vector.
     pub entry_points: Vec<FunctionSummary>,
     /// Used to get the expression representing an override
-    pub overrides: Vec<ConstraintHandle<abc_helper::Var>>,
+    pub overrides: Vec<Term>,
     /// Used to get the expression representing a constant
-    pub constants: Vec<ConstraintHandle<abc_helper::Var>>,
+    pub constants: Vec<Term>,
     /// Contains the types in the module converted to the AbcType form. Indexed by the handle.
     pub types: Vec<ConstraintHandle<AbcType>>,
 
@@ -172,15 +159,15 @@ impl ops::Index<crate::Handle<crate::Type>> for BoundsChecker {
 }
 
 impl ops::Index<crate::Handle<GlobalVariable>> for BoundsChecker {
-    type Output = ConstraintHandle<abc_helper::Var>;
-    fn index(&self, handle: crate::Handle<GlobalVariable>) -> &ConstraintHandle<abc_helper::Var> {
+    type Output = Term;
+    fn index(&self, handle: crate::Handle<GlobalVariable>) -> &Self::Output {
         &self.global_vars[handle.index()]
     }
 }
 
 impl ops::Index<crate::Handle<crate::Function>> for BoundsChecker {
     type Output = FunctionSummary;
-    fn index(&self, handle: crate::Handle<crate::Function>) -> &FunctionSummary {
+    fn index(&self, handle: crate::Handle<crate::Function>) -> &Self::Output {
         &self.functions[handle.index()]
     }
 }
@@ -192,33 +179,41 @@ impl ops::IndexMut<crate::Handle<crate::Function>> for BoundsChecker {
 }
 
 impl ops::Index<crate::Handle<crate::Expression>> for BoundsChecker {
-    type Output = ConstraintHandle<AbcExpression>;
+    type Output = Term;
     fn index(&self, handle: crate::Handle<crate::Expression>) -> &Self::Output {
         &self.global_exprs[&handle]
     }
 }
 
 impl ops::Index<crate::Handle<crate::Override>> for BoundsChecker {
-    type Output = ConstraintHandle<abc_helper::Var>;
+    type Output = Term;
     fn index(&self, handle: crate::Handle<crate::Override>) -> &Self::Output {
         &self.overrides[handle.index()]
     }
 }
 
 impl ops::Index<crate::Handle<crate::Constant>> for BoundsChecker {
-    type Output = ConstraintHandle<abc_helper::Var>;
+    type Output = Term;
     fn index(&self, handle: crate::Handle<crate::Constant>) -> &Self::Output {
         &self.constants[handle.index()]
     }
 }
 
+/// Container that holds the intermediate state of the function summary while it is being constructed.
+/// 
+/// Once the function has been parsed, [`abc_impl`] will turn this into a [`FunctionSummary`] by calling [`to_function_summary`].
+/// 
+/// [`abc_impl`]: BoundsChecker::abc_impl
+/// [`to_function_summary`]: PartialFunctionSummary::to_function_summary
+/// [`FunctionSummary`]: FunctionSummary
 struct PartialFunctionSummary {
     // Map from expression handles in the function to Expressions in the helper.
     // Expressions are always assigned to variables, so this actually maps to the handle of that variable.
-    pub expressions: FastHashMap<crate::Handle<crate::Expression>, ConstraintHandle<AbcExpression>>,
-    pub arguments: Vec<ConstraintHandle<abc_helper::Var>>,
-    pub local_variabes: Vec<ConstraintHandle<abc_helper::Var>>,
-    pub ret_ty: ConstraintHandle<AbcType>,
+    pub(self) expressions: FastHashMap<crate::Handle<crate::Expression>, Term>,
+    pub(self) arguments: Vec<Term>,
+    pub(self) local_variabes: Vec<Term>,
+    pub(self) ret_ty: ConstraintHandle<AbcType>,
+    nargs: u8,
 }
 
 /// Partial function summary is a function summary without a handle. The handle is added at the end.
@@ -235,14 +230,18 @@ impl PartialFunctionSummary {
 }
 
 impl ops::Index<crate::Handle<crate::Expression>> for PartialFunctionSummary {
-    type Output = ConstraintHandle<AbcExpression>;
+    type Output = Term;
+    /// PartialFunctionSummary can be indexed by an expression handle to get
+    /// the helper's `Term` corresponding to the expression.
     fn index(&self, handle: crate::Handle<crate::Expression>) -> &Self::Output {
         &self.expressions[&handle]
     }
 }
 
 impl ops::Index<crate::Handle<crate::LocalVariable>> for PartialFunctionSummary {
-    type Output = ConstraintHandle<abc_helper::Var>;
+    type Output = Term;
+    /// PartialFunctionSummary can be indexed by a local variable handle to get
+    /// the helper's `Term` corresponding to the local variable.
     fn index(&self, handle: crate::Handle<crate::LocalVariable>) -> &Self::Output {
         &self.local_variabes[handle.index()]
     }
@@ -250,35 +249,33 @@ impl ops::Index<crate::Handle<crate::LocalVariable>> for PartialFunctionSummary 
 
 /// A function summary.
 ///
-/// All fields are public because privatizing them limits the ability for other libraries
-/// to interact with these.
+/// A function summary works as a bridge between the function in the module and the `Summary` in the helper.
+/// 
+/// It can be indexed by an [`Expression`] handle to get the helper's `Term` corresponding to the expression.
+/// It can also be indexed by a [`LocalVariable`] handle to get the helper's `Term` corresponding to the local variable.
+/// 
+/// The `handle` field 
 pub struct FunctionSummary {
-    pub expressions: FastHashMap<crate::Handle<crate::Expression>, ConstraintHandle<AbcExpression>>,
-    pub arguments: Vec<ConstraintHandle<abc_helper::Var>>,
-    pub local_variabes: Vec<ConstraintHandle<abc_helper::Var>>,
+    pub expressions: FastHashMap<crate::Handle<crate::Expression>, Term>,
+    /// An arena containing the Terms that correspond to the arguments in the function.
+    pub arguments: Vec<Term>,
+    /// An arena containing the Terms that correspond to the local variables in the function.
+    /// Indexed by the handle of the local variable.
+    pub local_variabes: Vec<Term>,
+    /// The handle to the function's summary in the helper.
     pub handle: ConstraintHandle<abc_helper::Summary>,
     pub ret_ty: ConstraintHandle<AbcType>,
 }
 
-impl From<FunctionSummary> for PartialFunctionSummary {
-    fn from(value: FunctionSummary) -> Self {
-        PartialFunctionSummary {
-            expressions: value.expressions,
-            arguments: value.arguments,
-            local_variabes: value.local_variabes,
-            ret_ty: value.ret_ty,
-        }
-    }
-}
 impl ops::Index<crate::Handle<crate::Expression>> for FunctionSummary {
-    type Output = ConstraintHandle<AbcExpression>;
+    type Output = Term;
     fn index(&self, handle: crate::Handle<crate::Expression>) -> &Self::Output {
         &self.expressions[&handle]
     }
 }
 
 impl ops::Index<crate::Handle<crate::LocalVariable>> for FunctionSummary {
-    type Output = ConstraintHandle<abc_helper::Var>;
+    type Output = Term;
     fn index(&self, handle: crate::Handle<crate::LocalVariable>) -> &Self::Output {
         &self.local_variabes[handle.index()]
     }
@@ -287,7 +284,7 @@ impl ops::Index<crate::Handle<crate::LocalVariable>> for FunctionSummary {
 #[derive(Debug, Clone)]
 /// Either holds a u32 or a handle to an expression.
 enum ExpressionOrLiteral {
-    Expression(ConstraintHandle<AbcExpression>),
+    Expression(Term),
     Literal(u32),
 }
 
@@ -413,7 +410,7 @@ impl BoundsChecker {
         handle: crate::Handle<T>,
         term: &T,
         space: &str,
-    ) -> Result<ConstraintHandle<abc_helper::Var>, BoundsCheckError> {
+    ) -> Result<Term, BoundsCheckError> {
         let varname = match term.to_name() {
             Some(name) => {
                 // Make the var
@@ -439,34 +436,6 @@ impl BoundsChecker {
             .map_err(|e| BoundsCheckError::ConstraintHelperError(e))?;
 
         Ok(var)
-    }
-
-    fn expr_to_abc_expr(
-        &self,
-        expr_handle: crate::Handle<crate::Expression>,
-        module: &Module,
-        mod_info: &ModuleInfo,
-        func: &crate::Function,
-        func_checker: &mut FunctionSummary,
-    ) -> Result<ConstraintHandle<AbcExpression>, BoundsCheckError> {
-        // Any expression referenced here must already be in our handle..
-        let expr = &func.expressions[expr_handle];
-        use crate::Expression as Expr;
-        use AbcExpression as ABCExpr;
-        Ok(match expr {
-            Expr::Literal(t) => ABCExpr::Literal(format!("{t:?}")),
-            Expr::Constant(c) => ABCExpr::Var(self[*c].clone()),
-            Expr::Override(c) => ABCExpr::Var(self[*c].clone()),
-            Expr::FunctionArgument(idx) => {
-                ABCExpr::Var(func_checker.arguments[*idx as usize].clone())
-            }
-            _ => {
-                let msg =
-                    String::from("Unsupported expression type: ") + format!("{:?}", expr).as_str();
-                return Err(BoundsCheckError::Unsupported(msg));
-            }
-        }
-        .into())
     }
 
     // Not sure if we need this...
@@ -499,18 +468,6 @@ impl BoundsChecker {
             }
             _ => format!("{:?}", expr),
         }
-    }
-
-    /// Gets the name of the function.
-    ///
-    /// If the function's name is None, then the name is $unnamed_func_{index}
-    fn func_to_name(&self, module: &Module, func: crate::Handle<crate::Function>) -> String {
-        if let Some(name) = module.functions[func].name.as_ref() {
-            return name.clone();
-        }
-        let mut name = String::from("$anon_func_");
-        name.push_str(&func.index().to_string());
-        name
     }
 
     /// Make a name for the expression.
@@ -564,12 +521,12 @@ impl BoundsChecker {
     fn make_access(
         &mut self,
         base_expr_handle: crate::Handle<crate::Expression>,
-        base_expr: ConstraintHandle<AbcExpression>,
+        base_expr: Term,
         index: ExpressionOrLiteral,
         module_info: &ModuleWithInfo,
         func_ctx: &FunctionWithInfo,
         // Give me the source code for the expression...
-    ) -> Result<AbcExpression, BoundsCheckError> {
+    ) -> Result<Term, BoundsCheckError> {
         use crate::proc::TypeResolution;
         let base_expr_info = &func_ctx.info[base_expr_handle].ty;
         let (naga_ty, ref abc_ty) = match base_expr_info {
@@ -593,9 +550,7 @@ impl BoundsChecker {
             ($index:ident) => {
                 match $index {
                     ExpressionOrLiteral::Expression(ref e) => e.clone(),
-                    ExpressionOrLiteral::Literal(l) => {
-                        self.helper.add_expression(AbcExpression::new_literal(l))?
-                    }
+                    ExpressionOrLiteral::Literal(l) => Term::new_literal(l),
                 }
             };
         }
@@ -603,10 +558,8 @@ impl BoundsChecker {
         match abc_ty.as_ref() {
             AbcType::SizedArray { size, .. } => {
                 // Add the constraint that the index is less than the size
-                let index_literal: ConstraintHandle<AbcExpression> = as_expression!(index);
-                let size_literal: ConstraintHandle<AbcExpression> = self
-                    .helper
-                    .add_expression(AbcExpression::new_literal(*size))?;
+                let index_literal: Term = as_expression!(index);
+                let size_literal: Term = Term::new_literal(*size);
                 // Note: We can optimize this later on by reusing the same literal for 0.
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
@@ -618,24 +571,25 @@ impl BoundsChecker {
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
-                    AbcExpression::new_literal(0).into(),
+                    Term::new_literal(0),
                     &format!("{}[{}]", base_expr, index),
                 )?;
                 // Make a new expression that is an access to the base and the index.
-                Ok(AbcExpression::new_index_access(
+                Ok(Term::new_index_access(
                     base_expr.clone(),
                     index_literal.clone(),
                 ))
             }
             AbcType::DynamicArray { ty } => {
-                let index_literal: ConstraintHandle<AbcExpression> = as_expression!(index);
-                let res = AbcExpression::new_index_access(base_expr.clone(), index_literal.clone());
+                let index_literal: Term = as_expression!(index);
+                let res = Term::new_index_access(base_expr.clone(), index_literal.clone());
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
-                    AbcExpression::new_literal(0).into(),
+                    Term::new_literal(0),
                     &format!("{}[{}]", base_expr, &index),
                 )?;
+                // We need an expression for the array length..
                 let len_expression = self
                     .helper
                     .add_expression(AbcExpression::ArrayLength(base_expr.clone()))?;
@@ -650,7 +604,7 @@ impl BoundsChecker {
             }
             AbcType::Struct { members } => {
                 if let ExpressionOrLiteral::Literal(l) = index {
-                    Ok(AbcExpression::new_struct_access(
+                    Ok(Term::new_struct_access(
                         base_expr.clone(),
                         match &naga_ty.inner {
                             crate::TypeInner::Struct { members, .. } => {
@@ -686,10 +640,6 @@ impl BoundsChecker {
         }
     }
 
-    /// Given the TypeResolution for an access index, return the type that is being indexed into, along with its dimension, when this is
-    /// a nested access.
-    /// If it is a struct, then we return the type of that struct
-
     /// Visit an expression in a function, returning a handle to a variable that can be used to refer to the expression.
     ///
     /// If the expression has already been visited, then no work is done and we return the same handle as before.
@@ -700,7 +650,7 @@ impl BoundsChecker {
         expr_handle: crate::Handle<crate::Expression>,
         func_ctx: &FunctionWithInfo,
         func_summary: &mut PartialFunctionSummary,
-    ) -> Result<ConstraintHandle<AbcExpression>, BoundsCheckError> {
+    ) -> Result<Term, BoundsCheckError> {
         // If the expression has already been visited, we just return a handle to it.
         if let Some(e) = func_summary.expressions.get(&expr_handle) {
             return Ok(e.clone());
@@ -711,7 +661,7 @@ impl BoundsChecker {
         // Otherwise, we need to visit the expression.
         // We'll mark the type of the expression as we go.
         let expr = &func_ctx.func.expressions[expr_handle];
-        info!("Visiting expression: {:?}", expr);
+        log_info!("Visiting expression: {:?}", expr);
 
         // If the expression is named, then we use a var with that name and the result is an expression over said var.
         // After binding to a variable, we mark the expression's type.
@@ -722,39 +672,23 @@ impl BoundsChecker {
 
         let expr_info = &func_ctx.info[expr_handle];
 
-        let resolved = match expr {
-            Expr::Literal(lit) => AbcExpression::new_literal(lit.to_string()),
-            Expr::Constant(c) => self[*c].clone().into(),
-            Expr::Override(o) => self[*o].clone().into(),
+        let resolved: Term = match expr {
             // For right now, when we see load, we should just return the variable bound to the inner...
             // Although, for 'store', this really needs to mark the current variable name...
             // A 'load' should get the most recent variable name of the expression it is loading from...
             Expr::Load { pointer } => {
-                info!("Load expression: {:?}", func_ctx.func.expressions[*pointer]);
                 // We will make a new expression holding the value of the thing being loaded from...
-                let loaded = self.visit_expr(module_info, *pointer, func_ctx, func_summary);
-                AbcExpression::new_var(abc_helper::Var {
-                    name: self.expr_to_name(*pointer, func_ctx.func),
-                })
+                self.visit_expr(module_info, *pointer, func_ctx, func_summary)?
                 // When we load, we should use the last SSA variable name.
             }
-            Expr::FunctionArgument(idx) => {
-                let var = func_summary.arguments[*idx as usize].clone();
-                AbcExpression::new_var(var)
-            }
+            Expr::Literal(lit) => Term::new_literal(lit.to_string()),
+            Expr::Constant(c) => self[*c].clone(),
+            Expr::Override(o) => self[*o].clone(),
+            Expr::FunctionArgument(idx) => func_summary.arguments[*idx as usize].clone(),
             Expr::Binary { op, left, right } => {
                 let left = self.visit_expr(module_info, *left, func_ctx, func_summary)?;
                 let right = self.visit_expr(module_info, *right, func_ctx, func_summary)?;
-                if let Ok(op) = abc_helper::BinaryOp::try_from(*op) {
-                    AbcExpression::new_binary_op(op, left, right)
-                } else if let Ok(op) = abc_helper::CmpOp::try_from(*op) {
-                    AbcExpression::new_cmp_op(op, left, right)
-                } else {
-                    return Err(BoundsCheckError::Unsupported(format!(
-                        "Unsupported binary operation: {:?}",
-                        op
-                    )))?;
-                }
+                Self::binary_to_abc_expression(*op, left, right)?
             }
             Expr::Access { base, index, .. } => {
                 let new_base = self.visit_expr(module_info, *base, func_ctx, func_summary)?;
@@ -794,16 +728,8 @@ impl BoundsChecker {
                     r#""As" expressions"#.to_string(),
                 ));
             }
-            Expr::GlobalVariable(g) => {
-                // Get the last ssa counter for the global variable reference?
-                // No, honestly, we probably need to mark this.
-                // Use the last counter for the global variable...
-                self[*g].clone().into()
-            }
-            Expr::LocalVariable(l) => {
-                let var = func_summary[*l].clone();
-                AbcExpression::new_var(var)
-            }
+            Expr::GlobalVariable(g) => self[*g].clone(),
+            Expr::LocalVariable(l) => func_summary[*l].clone(),
             Expr::CallResult(c) => {
                 return Err(BoundsCheckError::Unexpected(
                     "Attempted to visit a call result.".to_string(),
@@ -816,39 +742,35 @@ impl BoundsChecker {
             }
         };
 
-        // If this is a named expression, place it into a variable.
-        if let Some(named_expression) = func_ctx.func.named_expressions.get(&expr_handle) {
-            let varname = self.next_var_name(named_expression);
-            let expr_as_var = self.helper.declare_var(abc_helper::Var { name: varname })?;
-            // make the expression.
-            let new_expr: ConstraintHandle<AbcExpression> = self
-                .helper
-                .add_expression(AbcExpression::new_var(expr_as_var.clone()))?;
+        // If this is a named expression, then we use the name to refer to said expression.
+        // Otherwise, the result is the term we evaluated.
+        let resolved =
+            if let Some(named_expression) = func_ctx.func.named_expressions.get(&expr_handle) {
+                let varname = self.next_var_name(named_expression);
+                let expr_var_name = self.helper.declare_var(abc_helper::Var { name: varname })?;
 
-            // Add the equality constraint.
-            self.helper.add_constraint(
-                new_expr.clone(),
-                abc_helper::ConstraintOp::Assign,
-                resolved.into(),
-            )?;
+                // Add the equality constraint.
+                self.helper.add_constraint(
+                    expr_var_name.clone(),
+                    abc_helper::ConstraintOp::Assign,
+                    resolved.into(),
+                )?;
 
-            // Maybe we should resolve the type?
-            let info = &func_ctx.info[expr_handle];
+                // TODO: Figure out if we need to mark the type of the expression?
+                // We shouldn't need to do this, right?
+                // let info = &func_ctx.info[expr_handle];
 
-            // Add the expression to the function context.
-            func_summary
-                .expressions
-                .insert(expr_handle, new_expr.clone());
+                expr_var_name
+                // AbcExpression::new_var(var)
+            } else {
+                resolved
+            };
+        func_summary
+            .expressions
+            .insert(expr_handle, resolved.clone());
 
-            Ok(new_expr)
-            // AbcExpression::new_var(var)
-        } else {
-            let resolved: ConstraintHandle<AbcExpression> = resolved.into();
-            func_summary
-                .expressions
-                .insert(expr_handle, resolved.clone());
-            Ok(resolved)
-        }
+        Ok(resolved)
+
         // #[allow(unreachable_code)]
         // Ok(())
     }
@@ -923,22 +845,20 @@ impl BoundsChecker {
                 } => {
                     let condition = self.visit_expr(module, *condition, func_ctx, func_summary)?;
                     if accept.len() > 0 {
-                        self.helper.begin_predicate_block(
-                            abc_helper::Predicate::from_expression_handle(condition.clone()),
-                        )?;
+                        self.helper.begin_predicate_block(condition.clone())?;
                         self.visit_block(accept, module, func_ctx, func_summary, Some(block))?;
                         self.helper.end_predicate_block()?;
                     }
                     if reject.len() > 0 {
                         self.helper
-                            .begin_predicate_block(abc_helper::Predicate::new_not(
-                                abc_helper::Predicate::from_expression_handle(condition.clone()),
-                            ))?;
+                            .begin_predicate_block(Term::new_not(condition))?;
                         self.visit_block(reject, module, func_ctx, func_summary, Some(block))?;
                         self.helper.end_predicate_block()?;
                     }
                 }
                 Statement::Store { pointer, value } => {
+                    // If whatever expression we are storing to has a name, then we use that name.
+                    // When we see a store, we actually mark the term that we loaded from with the next name.
                     let pointer = self.visit_expr(module, *pointer, func_ctx, func_summary)?;
                     let value = self.visit_expr(module, *value, func_ctx, func_summary)?;
                     // TODO: Figure out if we need to increment the identifer for the pointer.
@@ -962,85 +882,34 @@ impl BoundsChecker {
     fn check_function(
         &mut self,
         module: &ModuleWithInfo,
-        (func_handle, fun): (crate::Handle<crate::Function>, &crate::Function),
-    ) -> Result<FunctionSummary, BoundsCheckError> {
-        // Get the function info from the module
-        let func_info = &module.info[func_handle];
+        func: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        name: &String,
+    ) -> Result<(), BoundsCheckError> {
+        let func_info = func.info;
         // Exit early if the function can kill, as this isn't supported.
         if func_info.may_kill {
             return Err(BoundsCheckError::Unsupported(
                 "Functions that can kill invocations.".to_string(),
             ));
         }
-        // Make the function name
-        let func_name = self.func_to_name(&module.module, func_handle);
-        // Calculate the number of arguments, returning an error if there are too many.
-        let nargs: u8 = fun.arguments.len().try_into().map_err(|e| {
-            BoundsCheckError::Unsupported("Too many function arguments".to_string())
-        })?;
 
-        let ret_ty = match fun.result {
-            Some(crate::FunctionResult { ty, .. }) => self[ty].clone(),
-            None => self.helper.none_type(),
-        };
-
-        // Create the bounds info struct that we use to populate the constraints on the function.
-        let mut func_bounds_info = PartialFunctionSummary {
-            expressions: Default::default(),
-            arguments: Vec::with_capacity(fun.arguments.len()),
-            local_variabes: Vec::with_capacity(fun.local_variables.len()),
-            ret_ty,
-        };
-
-        for (var_handle, var) in fun.local_variables.iter() {
-            let var = self.mark_var(var_handle, var, &func_name)?;
-            func_bounds_info.local_variabes.push(var);
+        for (var_handle, var) in func.func.local_variables.iter() {
+            let var = self.mark_var(var_handle, var, name)?;
+            func_summary.local_variabes.push(var);
         }
 
         // begin the summary.
-        self.helper.begin_summary(func_name, nargs)?;
-
-        if let Some(crate::FunctionResult { ty, .. }) = fun.result {
+        if let Some(crate::FunctionResult { ty, .. }) = func.func.result {
             let ty = self[ty].clone();
             self.helper.mark_return_type(ty)?;
         }
 
-        for (pos, arg) in fun.arguments.iter().enumerate() {
-            let name = arg
-                .to_name()
-                .clone()
-                .unwrap_or(String::from("$anon_arg_") + &pos.to_string());
-            // Get the variable handle..
-            let var = self
-                .helper
-                .declare_var(abc_helper::Var { name: name.into() })?;
-
-            func_bounds_info.arguments.push(var.clone());
-
-            // Mark the type of the function argument..
-            let ty = self.types[arg.to_type().index()].clone();
-            self.helper.mark_type(var.clone(), ty.clone())?;
-        }
-
-        // Now, go through the body of the function
-        let func_with_info = FunctionWithInfo {
-            handle: func_handle,
-            func: fun,
-            info: func_info,
-        };
-
-        self.visit_block(
-            &fun.body,
-            module,
-            &func_with_info,
-            &mut func_bounds_info,
-            None,
-        )?;
+        self.visit_block(&func.func.body, module, func, func_summary, None)?;
 
         // End the summary
-        let summary = self.helper.end_summary()?;
 
-        Ok(func_bounds_info.to_function_summary(summary))
+        Ok(())
     }
 
     // pub fn mark_type(&mut self, ty: &crate::Type) {
@@ -1055,27 +924,21 @@ impl BoundsChecker {
     // Converts a binary operator to an ABC expression
     fn binary_to_abc_expression(
         op: crate::BinaryOperator,
-        lhs: ConstraintHandle<AbcExpression>,
-        rhs: ConstraintHandle<AbcExpression>,
-    ) -> Result<ConstraintHandle<AbcExpression>, BoundsCheckError> {
+        lhs: Term,
+        rhs: Term,
+    ) -> Result<Term, BoundsCheckError> {
         use crate::BinaryOperator;
         use abc_helper::BinaryOp;
         use abc_helper::CmpOp;
         use abc_helper::Predicate;
         if let Some(binop) = op.try_into().ok() {
-            Ok(AbcExpression::new_binary_op(binop, lhs, rhs).into())
+            Ok(Term::new_binary_op(binop, lhs, rhs))
         } else if let Some(cmpop) = op.try_into().ok() {
-            let pred = Predicate::new_comparison(cmpop, lhs, rhs);
-            Ok(AbcExpression::new_pred(pred).into())
+            Ok(Term::new_comparison(cmpop, lhs, rhs))
         } else {
             match op {
-                BinaryOperator::LogicalAnd => {
-                    let pred = Predicate::new_and(
-                        Predicate::from_expression_handle(lhs),
-                        Predicate::from_expression_handle(rhs),
-                    );
-                    Ok(AbcExpression::new_pred(pred).into())
-                }
+                BinaryOperator::LogicalAnd => Ok(Term::new_logical_and(lhs, rhs)),
+                BinaryOperator::LogicalOr => Ok(Term::new_logical_or(lhs, rhs)),
                 _ => Err(BoundsCheckError::Unsupported(
                     "Unsupported binary operator".to_string(),
                 )),
@@ -1095,7 +958,7 @@ impl BoundsChecker {
         &mut self,
         expr_handle: crate::Handle<crate::Expression>,
         module: &ModuleWithInfo,
-    ) -> Result<ConstraintHandle<AbcExpression>, BoundsCheckError> {
+    ) -> Result<Term, BoundsCheckError> {
         use crate::Expression as Expr;
         use AbcExpression as ABCExpr;
 
@@ -1110,31 +973,15 @@ impl BoundsChecker {
 
         // It's annoying because naga's decision to use handles means we have to write
         // this logic twice. Once for the global expressions and once for the function expressions.
-        let res: ConstraintHandle<AbcExpression> = match expr {
-            Expr::Literal(t) => ABCExpr::Literal(format!("{t}")),
-            Expr::Constant(c) => ABCExpr::Var(self[*c].clone()),
+        let res: Term = match expr {
+            Expr::Literal(t) => Term::new_literal(format!("{t}")),
+            Expr::Constant(c) => self[*c].clone(),
             Expr::Binary { op, left, right } => {
                 let left = self.global_expression_resolution(*left, module)?;
                 let right = self.global_expression_resolution(*right, module)?;
+                Self::binary_to_abc_expression(*op, left, right)?
                 // A binary op with a boolean result maps to a predicate
                 // Otherwise, it maps to a binary op.
-                let bin_op: Option<abc_helper::BinaryOp> = (*op).try_into().ok();
-                match bin_op {
-                    Some(t) => ABCExpr::BinaryOp(t, left, right),
-                    None => {
-                        // Convert the op into a predicate...
-                        let op = (*op).try_into().map_err(|_| {
-                            BoundsCheckError::Unsupported(format!(
-                                "Unsupported binary op: {:?}",
-                                op
-                            ))
-                        })?;
-                        ABCExpr::Pred(
-                            abc_helper::Predicate::new_comparison(op, left.clone(), right.clone())
-                                .into(),
-                        )
-                    }
-                }
             }
             _ => {
                 let msg = String::from("Unsupported global expression type: ")
@@ -1147,6 +994,54 @@ impl BoundsChecker {
         Ok(res)
     }
 
+    #[inline]
+    fn make_function_summary(
+        &self,
+        fun: &crate::Function,
+    ) -> Result<PartialFunctionSummary, BoundsCheckError> {
+        let nargs: u8 = fun.arguments.len().try_into().map_err(|_| {
+            BoundsCheckError::Unsupported("Too many arguments to function.".to_string())
+        })?;
+        Ok(PartialFunctionSummary {
+            arguments: Vec::with_capacity(nargs as usize),
+            expressions: crate::FastHashMap::default(),
+            local_variabes: Vec::with_capacity(fun.local_variables.len()),
+            ret_ty: match fun.result {
+                Some(crate::FunctionResult { ty, .. }) => self[ty].clone(),
+                None => self.helper.none_type(),
+            },
+            nargs,
+        })
+    }
+
+    /// Adds arguments to the current active summary. Also gets their types.
+    fn make_arg(
+        &mut self,
+        arg: &FunctionArgument,
+        fun: &crate::Function,
+        pos: usize,
+    ) -> Result<Term, BoundsCheckError> {
+        // Name doesn't have to be unique. It will be prefixed by `@` in the ABC.
+        let name = arg
+            .to_name()
+            .clone()
+            .unwrap_or(String::from("arg") + &pos.to_string());
+        // Get the variable handle..
+        let var = self
+            .helper
+            .add_argument(name, self.types[arg.to_type().index()].clone())?;
+        Ok(var)
+    }
+
+    fn func_to_name<T: ToString>(fun: &crate::Function, suffix: T) -> String {
+        if let Some(name) = fun.name.as_ref() {
+            name.clone()
+        } else {
+            let mut name = String::from("$anon_func_");
+            name.push_str(&suffix.to_string());
+            name
+        }
+    }
     pub fn abc_impl(&mut self, module: &Module, info: &ModuleInfo) -> Result<(), BoundsCheckError> {
         // to begin with, mark types...
 
@@ -1165,18 +1060,14 @@ impl BoundsChecker {
             self.constants.push(cnst.clone());
             // Push the initialization of the constant as a constraint.
             // Any expressions here can only refer to previously defined constants, right?
-            let cnst_as_expr: AbcExpression = cnst.into();
 
             // Resolve the initialization to an expression handle
             let expr =
                 self.global_expression_resolution(var.init, &ModuleWithInfo { module, info })?;
 
             // Mark the constraint of the initialization.
-            self.helper.add_constraint(
-                cnst_as_expr.into(),
-                abc_helper::ConstraintOp::Assign,
-                expr,
-            )?;
+            self.helper
+                .add_constraint(cnst, abc_helper::ConstraintOp::Assign, expr)?;
         }
         self.overrides = Vec::with_capacity(module.overrides.len());
         for (var_handle, var) in module.overrides.iter() {
@@ -1189,18 +1080,100 @@ impl BoundsChecker {
             self.global_vars.push(var);
         }
 
-        for fun in module.functions.iter() {
-            let new_summary = self.check_function(&ModuleWithInfo { module, info }, fun)?;
-            self.functions.push(new_summary);
+        for (fun_handle, fun) in module.functions.iter() {
+            // Get the function name
+            let func_name = Self::func_to_name(fun, fun_handle.index());
+            log_info!("Checking function: {}", func_name);
+            // Make the partial summary.
+            let mut partial_summary = self.make_function_summary(fun)?;
+            let nargs = partial_summary.nargs;
+            self.helper.begin_summary(func_name.clone(), nargs)?;
+            for (pos, arg) in fun.arguments.iter().enumerate() {
+                let var = self.make_arg(arg, fun, pos)?;
+                partial_summary.arguments.push(var);
+            }
+
+            let mut finfo = FunctionWithInfo {
+                func: fun,
+                info: &info[fun_handle],
+            };
+
+            // Begin the summary
+
+            // Add the function arguments
+            // This is done outside of the `check_function` method because
+            // entry points do something special with their arguments.
+
+            // Now begin the common function handling logic
+            self.check_function(
+                &ModuleWithInfo { module, info },
+                &mut finfo,
+                &mut partial_summary,
+                &func_name,
+            )?;
+            let summary_handle = self.helper.end_summary()?;
+            self.functions
+                .push(partial_summary.to_function_summary(summary_handle));
         }
 
         // Entry points contain function summaries.
-        // for ep in module.entry_points.iter() {
-        //     let new_summary = self.check_function(&ModuleWithInfo { module, info }, ep.function)?;
-        //     // I must be able to mark additional constraints within the function.
-        //     // E.g., the arguments to the function must correspond to
-        //     self.entry_points.push(new_summary);
-        // }
+        for (pos, ep) in module.entry_points.iter().enumerate() {
+            log_info!("Checking entry point: {}", ep.name);
+            // An entry
+            let func_name = ep.name.clone();
+            let mut partial_summary = self.make_function_summary(&ep.function)?;
+            let nargs = partial_summary.nargs;
+            self.helper.begin_summary(func_name.clone(), nargs)?;
+            let ep_info = info.get_entry_point(pos);
+            let mut finfo = FunctionWithInfo {
+                func: &ep.function,
+                info: &ep_info,
+            };
+            for (pos, arg) in ep.function.arguments.iter().enumerate() {
+                let var = self.make_arg(arg, &ep.function, pos)?;
+                // This arg *must* be a bound.
+                use crate::Binding;
+                match arg.binding {
+                    Some(Binding::BuiltIn(crate::BuiltIn::LocalInvocationId)) => {
+                        // If this is a local invocation id, then we add the constraint on its range from the workgroup information
+                        // that we already have.
+                        for (dim, high) in ep.workgroup_size.iter().enumerate() {
+                            // make a term for the access to the 0th element of the expression.
+                            let access_term =
+                                Term::new_index_access(var.clone(), Term::new_literal(dim));
+                            self.helper.mark_range(access_term, 0u32, *high - 1)?;
+                            // We need to mark the range of the variable.
+                        }
+                    }
+                    Some(Binding::BuiltIn(t)) => {
+                        log_info!("Built-in binding not yet accounted for: {:?}", t);
+                    }
+                    Some(_) => {
+                        return Err(BoundsCheckError::Unsupported(
+                            "Entry point argument with a non built-in binding.".to_string(),
+                        ));
+                    }
+                    None => {
+                        // According to naga, this should never happen
+                        unreachable!();
+                    }
+                };
+                partial_summary.arguments.push(var);
+            }
+            // For entry points, we need to make a new summary.
+
+            self.check_function(
+                &ModuleWithInfo { module, info },
+                &mut finfo,
+                &mut partial_summary,
+                &func_name,
+            )?;
+
+            let summary_handle = self.helper.end_summary()?;
+            // End the summary
+            self.entry_points
+                .push(partial_summary.to_function_summary(summary_handle));
+        }
 
         Ok(())
     }
