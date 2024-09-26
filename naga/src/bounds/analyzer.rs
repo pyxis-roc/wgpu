@@ -10,7 +10,11 @@
 
 #![allow(dead_code, unused_variables, unused_imports)]
 
-use std::{collections::HashMap, fmt::Debug, ops};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    ops
+};
 
 use super::helper_interface::{self, HasName, HasType};
 
@@ -22,7 +26,6 @@ use abc_helper::{self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, P
 use log::info as log_info;
 use rustc_hash::FxHashMap;
 
-
 /// Convenience struct used to pass around a module with its info together in one term.
 #[derive(Clone, Copy)]
 struct ModuleWithInfo<'a> {
@@ -30,13 +33,11 @@ struct ModuleWithInfo<'a> {
     info: &'a ModuleInfo,
 }
 
-
 /// Convenience struct used to pass around a function with its info together in one term.
 struct FunctionWithInfo<'a> {
     func: &'a crate::Function,
     info: &'a crate::valid::FunctionInfo,
 }
-
 
 /// Macro used only for debugging purposes that prints the variant of an expression.
 #[allow(unused_macros)]
@@ -115,14 +116,13 @@ macro_rules! statement_variant {
 /// Type alias for the handle type used in the AbcHelper
 type ConstraintHandle<T> = <abc_helper::ConstraintHelper as ConstraintInterface>::Handle<T>;
 
-
 /// The bounds checker acts acts as the Bridge between a [`Module`] and the Constraint Helper.
-/// 
+///
 /// This struct can be referenced, similarly to [`ModuleInfo`], to get the bounds requirements for the functions in the module.
-/// 
+///
 /// To populate the bounds information, call [`abc_impl`]
-/// 
-/// 
+///
+///
 /// [`Module`]: crate::Module
 /// [`ModuleInfo`]: crate::ModuleInfo
 /// [`abc_impl`]: BoundsChecker::abc_impl
@@ -200,9 +200,9 @@ impl ops::Index<crate::Handle<crate::Constant>> for BoundsChecker {
 }
 
 /// Container that holds the intermediate state of the function summary while it is being constructed.
-/// 
+///
 /// Once the function has been parsed, [`abc_impl`] will turn this into a [`FunctionSummary`] by calling [`to_function_summary`].
-/// 
+///
 /// [`abc_impl`]: BoundsChecker::abc_impl
 /// [`to_function_summary`]: PartialFunctionSummary::to_function_summary
 /// [`FunctionSummary`]: FunctionSummary
@@ -250,11 +250,11 @@ impl ops::Index<crate::Handle<crate::LocalVariable>> for PartialFunctionSummary 
 /// A function summary.
 ///
 /// A function summary works as a bridge between the function in the module and the `Summary` in the helper.
-/// 
+///
 /// It can be indexed by an [`Expression`] handle to get the helper's `Term` corresponding to the expression.
 /// It can also be indexed by a [`LocalVariable`] handle to get the helper's `Term` corresponding to the local variable.
-/// 
-/// The `handle` field 
+///
+/// The `handle` field
 pub struct FunctionSummary {
     pub expressions: FastHashMap<crate::Handle<crate::Expression>, Term>,
     /// An arena containing the Terms that correspond to the arguments in the function.
@@ -357,18 +357,7 @@ impl BoundsChecker {
             Scalar(s) => Ok(AbcType::Scalar(AbcScalar::from(s))),
             Vector { size, scalar } => Ok(AbcType::SizedArray {
                 ty: AbcType::Scalar(scalar.into()).into(),
-                size: match size {
-                    crate::VectorSize::Quad => unsafe { std::num::NonZeroU32::new_unchecked(4) },
-                    crate::VectorSize::Tri => unsafe { std::num::NonZeroU32::new_unchecked(3) },
-                    crate::VectorSize::Bi => unsafe { std::num::NonZeroU32::new_unchecked(2) },
-                    // future proofing for more vector sizes.
-                    #[allow(unreachable_patterns)]
-                    _ => {
-                        return Err(BoundsCheckError::Unsupported(
-                            "Unsupported vector size".to_string(),
-                        ));
-                    }
-                },
+                size: size.into(),
             }),
             Struct { ref members, .. } => {
                 // We make a struct type
@@ -673,6 +662,10 @@ impl BoundsChecker {
         let expr_info = &func_ctx.info[expr_handle];
 
         let resolved: Term = match expr {
+            Expr::Splat { size, value } => Term::new_splat(
+                self.visit_expr(module_info, *value, func_ctx, func_summary)?,
+                (*size).into(),
+            ),
             // For right now, when we see load, we should just return the variable bound to the inner...
             // Although, for 'store', this really needs to mark the current variable name...
             // A 'load' should get the most recent variable name of the expression it is loading from...
@@ -714,19 +707,30 @@ impl BoundsChecker {
                 )?
             }
             Expr::As {
-                convert: Some(_), ..
-            } => {
-                return Err(BoundsCheckError::Unsupported(
-                    "As expr with none none convert".to_string(),
-                ))
-            }
-            Expr::As {
-                expr: a, kind: s, ..
+                expr: a,
+                kind: s,
+                convert: b,
             } => {
                 let a = self.visit_expr(module_info, *a, func_ctx, func_summary)?;
-                return Err(BoundsCheckError::Unsupported(
-                    r#""As" expressions"#.to_string(),
-                ));
+                use crate::ScalarKind;
+                match (s, b) {
+                    (ScalarKind::Sint, Some(b)) => {
+                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Sint(*b))
+                    }
+                    (ScalarKind::Uint, Some(b)) => {
+                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Uint(*b))
+                    }
+                    (ScalarKind::Float, Some(b)) => {
+                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Float(*b))
+                    }
+                    (ScalarKind::Bool, _) => Term::new_unit_pred(a),
+                    _ => {
+                        return Err(BoundsCheckError::Unsupported(format!(
+                            "Cast of type {:?} of size {:?}",
+                            s, b
+                        )));
+                    }
+                }
             }
             Expr::GlobalVariable(g) => self[*g].clone(),
             Expr::LocalVariable(l) => func_summary[*l].clone(),
@@ -775,6 +779,178 @@ impl BoundsChecker {
         // Ok(())
     }
 
+    fn visit_statement(
+        &mut self,
+        stmt: &crate::Statement,
+        module: &ModuleWithInfo,
+        func_ctx: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        block_ctx: Option<&crate::Block>,
+    ) -> Result<bool, BoundsCheckError> {
+        use crate::Statement;
+        match stmt {
+            Statement::Loop {
+                body,
+                continuing,
+                break_if,
+            } => {
+                if break_if.is_some() {
+                    return Err(BoundsCheckError::Unsupported(
+                        "Loop with a non empty break_if".to_string(),
+                    ));
+                }
+                if body.len() == 0 {
+                    return Err(BoundsCheckError::Unsupported(
+                        "Loop with an empty body".to_string(),
+                    ));
+                }
+                // we want an iterator over body
+                let mut body_iter = body.into_iter().peekable();
+                // Go through all of the emits.
+
+                while let Some(Statement::Emit(ref r)) = body_iter.peek() {
+                    // iterate through the expressions in r
+                    for e in r.clone().into_iter() {
+                        self.visit_expr(module, e, func_ctx, func_summary)?;
+                    }
+                    body_iter.next();
+                }
+                // We expect to see an If (condition) { {}; break; } structure.
+                // This indicates that this is a traditional loop.
+                // Otherwise, this is the `do-while` loop form that, well, we just don't
+                match body_iter.next() {
+                    Some(Statement::If {
+                        condition,
+                        accept,
+                        reject,
+                    }) if matches!(reject.get(0), Some(Statement::Break)) && accept.len() == 0 => {
+                        // Accept must be of len 1 with a single statement that is a break.
+                        let condition =
+                            self.visit_expr(module, *condition, func_ctx, func_summary)?;
+                        self.helper.begin_loop(condition)?;
+                    },
+                    Some(s) => 
+                        return Err(BoundsCheckError::Unsupported(
+                            format!(
+                                "Unsupported loop structure, expecting If have {}", statement_variant!(s)
+                            )
+                        )),
+                    None => {
+                        return Err(BoundsCheckError::Unsupported(
+                            "Loop with an empty body".to_string(),
+                        ));
+                    }
+                }
+                // Now that we have gotten the loop structure out of the way, we can visit the rest of the statements.
+                for smt in body_iter {
+                    self.visit_statement(smt, module, func_ctx, func_summary, block_ctx)?;
+                }
+                for stmt in continuing {
+                    self.visit_statement(stmt, module, func_ctx, func_summary, block_ctx)?;
+                }
+
+            }
+            Statement::Emit(ref r) => {
+                for e in r.clone().into_iter() {
+                    self.visit_expr(module, e, func_ctx, func_summary)?;
+                }
+            }
+            Statement::Call {
+                function,
+                arguments,
+                result,
+            } => {
+                // Start by getting the function we are invoking, so that we error early if the function hasn't been looked at yet.
+                let called_func =
+                    self.functions
+                        .get(function.index())
+                        .ok_or(BoundsCheckError::Unexpected(
+                            "Reference to a function that has not been declared.".to_string(),
+                        ))?;
+                let handle = called_func.handle.clone();
+                // Using collect looks cleaner, but it's slower since we know the capacity of the vector.
+                let mut args = Vec::with_capacity(arguments.len());
+                for arg in arguments {
+                    let arg = self.visit_expr(module, *arg, func_ctx, func_summary)?;
+                    args.push(arg);
+                }
+
+                let res_into = if let Some(result) = result {
+                    // If there is a result, we store the handle to expression that lets us refer to it.
+                    let result_name = self.expr_to_name(*result, func_ctx.func);
+                    let var = self
+                        .helper
+                        .declare_var(abc_helper::Var { name: result_name })?;
+                    func_summary
+                        .expressions
+                        .insert(*result, self.helper.make_call(handle, args, Some(var))?);
+                } else {
+                    // If there is no result, we just make the call.
+                    self.helper.make_call(handle, args, None)?;
+                };
+
+                // Then we add a constraint tht the result equals the call.
+            }
+            Statement::Return { value: Some(v) } => {
+                // Visit the containing expression.
+                let expr = self.visit_expr(module, *v, func_ctx, func_summary)?;
+                // These variables were assigned to in the block.
+                self.helper.mark_return(Some(expr))?;
+                return Ok(false);
+            }
+            Statement::Return { value: None } => {
+                self.helper.mark_return(None)?;
+                // When we get to a return, we stop processing all statements in the block.
+                return Ok(false);
+            }
+            Statement::Break => {
+                // If the block context is a loop, then we immediately stop processing more elements in the block.
+                self.helper.mark_break()?;
+                return Ok(false);
+            }
+            Statement::Continue => {
+                self.helper.mark_continue()?;
+                return Ok(false);
+            }
+            Statement::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                let condition = self.visit_expr(module, *condition, func_ctx, func_summary)?;
+                if accept.len() > 0 {
+                    self.helper.begin_predicate_block(condition.clone())?;
+                    self.visit_block(accept, module, func_ctx, func_summary, block_ctx)?;
+                    self.helper.end_predicate_block()?;
+                }
+                if reject.len() > 0 {
+                    self.helper
+                        .begin_predicate_block(Term::new_not(condition))?;
+                    self.visit_block(reject, module, func_ctx, func_summary, block_ctx)?;
+                    self.helper.end_predicate_block()?;
+                }
+            }
+            Statement::Store { pointer, value } => {
+                // If whatever expression we are storing to has a name, then we use that name.
+                // When we see a store, we actually mark the term that we loaded from with the next name.
+                let pointer = self.visit_expr(module, *pointer, func_ctx, func_summary)?;
+                let value = self.visit_expr(module, *value, func_ctx, func_summary)?;
+                // TODO: Figure out if we need to increment the identifer for the pointer.
+                self.helper
+                    .add_constraint(pointer, abc_helper::ConstraintOp::Assign, value)?;
+            }
+            Statement::Block(ref b) => {
+                self.visit_block(b, module, func_ctx, func_summary, block_ctx)?
+            }
+            _ => {
+                return Err(BoundsCheckError::Unsupported(
+                    "Unsupported statement type: ".to_owned() + statement_variant!(stmt),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
     fn visit_block(
         &mut self,
         block: &crate::Block,
@@ -786,93 +962,10 @@ impl BoundsChecker {
         use crate::Statement;
         // Function info...
         for stmt in block.iter() {
-            match stmt {
-                Statement::Emit(ref r) => {
-                    for e in r.clone().into_iter() {
-                        self.visit_expr(module, e, func_ctx, func_summary)?;
-                    }
-                }
-                Statement::Call {
-                    function,
-                    arguments,
-                    result,
-                } => {
-                    // Start by getting the function we are invoking, so that we error early if the function hasn't been looked at yet.
-                    let called_func = self.functions.get(function.index()).ok_or(
-                        BoundsCheckError::Unexpected(
-                            "Reference to a function that has not been declared.".to_string(),
-                        ),
-                    )?;
-                    let handle = called_func.handle.clone();
-                    // Using collect looks cleaner, but it's slower since we know the capacity of the vector.
-                    let mut args = Vec::with_capacity(arguments.len());
-                    for arg in arguments {
-                        let arg = self.visit_expr(module, *arg, func_ctx, func_summary)?;
-                        args.push(arg);
-                    }
-
-                    let res_into = if let Some(result) = result {
-                        // If there is a result, we store the handle to expression that lets us refer to it.
-                        let result_name = self.expr_to_name(*result, func_ctx.func);
-                        let var = self
-                            .helper
-                            .declare_var(abc_helper::Var { name: result_name })?;
-                        func_summary
-                            .expressions
-                            .insert(*result, self.helper.make_call(handle, args, Some(var))?);
-                    } else {
-                        // If there is no result, we just make the call.
-                        self.helper.make_call(handle, args, None)?;
-                    };
-
-                    // Then we add a constraint tht the result equals the call.
-                }
-                Statement::Return { value: Some(v) } => {
-                    // Visit the containing expression.
-                    let expr = self.visit_expr(module, *v, func_ctx, func_summary)?;
-                    // These variables were assigned to in the block.
-                    self.helper.mark_return(Some(expr))?;
-                }
-                Statement::Return { value: None } => {
-                    self.helper.mark_return(None)?;
-                    // When we get to a return, we stop processing all statements in the block.
-                    return Ok(());
-                }
-                Statement::If {
-                    condition,
-                    accept,
-                    reject,
-                } => {
-                    let condition = self.visit_expr(module, *condition, func_ctx, func_summary)?;
-                    if accept.len() > 0 {
-                        self.helper.begin_predicate_block(condition.clone())?;
-                        self.visit_block(accept, module, func_ctx, func_summary, Some(block))?;
-                        self.helper.end_predicate_block()?;
-                    }
-                    if reject.len() > 0 {
-                        self.helper
-                            .begin_predicate_block(Term::new_not(condition))?;
-                        self.visit_block(reject, module, func_ctx, func_summary, Some(block))?;
-                        self.helper.end_predicate_block()?;
-                    }
-                }
-                Statement::Store { pointer, value } => {
-                    // If whatever expression we are storing to has a name, then we use that name.
-                    // When we see a store, we actually mark the term that we loaded from with the next name.
-                    let pointer = self.visit_expr(module, *pointer, func_ctx, func_summary)?;
-                    let value = self.visit_expr(module, *value, func_ctx, func_summary)?;
-                    // TODO: Figure out if we need to increment the identifer for the pointer.
-                    self.helper
-                        .add_constraint(pointer, abc_helper::ConstraintOp::Assign, value)?;
-                }
-                Statement::Block(ref b) => {
-                    self.visit_block(b, module, func_ctx, func_summary, Some(block))?
-                }
-                _ => {
-                    return Err(BoundsCheckError::Unsupported(
-                        "Unsupported statement type: ".to_owned() + statement_variant!(stmt),
-                    ));
-                }
+            // If visit_statement returns false, that means we hit control flow and should stop processing more
+            // elements in the block (e.g, we hit a `break`/`return`/`continue`).
+            if ! self.visit_statement(stmt, module, func_ctx, func_summary, Some(block))? {
+                break;
             }
         }
 

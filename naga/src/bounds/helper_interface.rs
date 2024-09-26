@@ -1,5 +1,26 @@
 use abc_helper::{AbcScalar, BinaryOp, CmpOp};
-// ABCExpr::BinaryOp into a
+
+
+
+impl From<crate::VectorSize> for std::num::NonZeroU8 {
+    fn from(size: crate::VectorSize) -> Self {
+        match size {
+            crate::VectorSize::Quad => unsafe { std::num::NonZeroU8::new_unchecked(4) },
+            crate::VectorSize::Tri => unsafe { std::num::NonZeroU8::new_unchecked(3) },
+            crate::VectorSize::Bi => unsafe { std::num::NonZeroU8::new_unchecked(2) },
+        }
+    }
+}
+
+impl From<crate::VectorSize> for std::num::NonZeroU32 {
+    fn from(size: crate::VectorSize) -> Self {
+        match size {
+            crate::VectorSize::Quad => unsafe { std::num::NonZeroU32::new_unchecked(4) },
+            crate::VectorSize::Tri => unsafe { std::num::NonZeroU32::new_unchecked(3) },
+            crate::VectorSize::Bi => unsafe { std::num::NonZeroU32::new_unchecked(2) },
+        }
+    }
+}
 
 impl std::fmt::Display for crate::Literal {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
