@@ -2,9 +2,9 @@ use naga::valid::{Capabilities, ValidationFlags};
 
 use crate::snapshots::Input;
 
-#[test]
-fn test_bounds_checker_simple() {
-    let input = Input::new(Some("abc"), "shader_17", "wgsl");
+
+fn do_shader_test(subdir: Option<&str>, path: &str, extension: &str) {
+    let input = Input::new(subdir, path, extension);
     let source = input.read_source();
     let mut parser = naga::front::wgsl::Frontend::new();
     let module = parser.parse(&source).unwrap();
@@ -23,4 +23,31 @@ fn test_bounds_checker_simple() {
 
     // bounds_checker.helper.write_to_stream(&mut std::io::stdout()).unwrap();
     assert!(res.is_ok());
+}
+
+
+/// 
+#[test]
+fn test_shader_1() {
+    do_shader_test(Some("abc"), "shader_1", "wgsl");
+}
+
+/// # Features tested:
+/// - Splat expression
+#[test]
+fn test_shader_3() {
+    do_shader_test(Some("abc"), "shader_3", "wgsl");
+}
+
+/// # Features tested:
+/// - As expression i32(...)
+/// - For loop
+#[test]
+fn test_concatenate10() {
+    do_shader_test(Some("abc"), "concatenate10_kernel", "wgsl");
+}
+
+#[test]
+fn test_shader_17() {
+    do_shader_test(Some("abc"), "shader_17", "wgsl");
 }
