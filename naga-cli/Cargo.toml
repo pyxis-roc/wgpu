@@ -40,4 +40,5 @@ features = [
     "dot-out",
     "serialize",
     "deserialize",
+    "bounds-check",
 ]

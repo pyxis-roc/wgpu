@@ -831,6 +831,21 @@ fn write_output(
             .unwrap_pretty();
             fs::write(output_path, wgsl)?;
         }
+        "abc" => {
+            use naga::bounds::BoundsChecker;
+            if let Some(info) = info {
+                let mut b = BoundsChecker::new();
+                if let Err(e) = b.abc_impl(&module, &info) {
+                    eprintln!("Bounds checking failed: {e}. Not writing to file.");
+                } else {
+                    let mut file = fs::File::create(output_path)?;
+                    b.helper.write_to_stream(&mut file)?;
+                }
+
+            } else {
+                eprintln!("Validation failed, skipping bounds checking");
+            }
+        }
         other => {
             println!("Unknown output extension: {other}");
         }
