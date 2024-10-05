@@ -8,19 +8,16 @@
 
 // use super::BoundsInfo;
 
-#![allow(dead_code, unused_variables, unused_imports)]
+#![allow(dead_code, unused_variables, unused_imports, clippy::match_wildcard_for_single_variants)]
 
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    ops
-};
+use std::{collections::HashMap, fmt::Debug, ops};
 
 use super::helper_interface::{self, HasName, HasType};
 
 use crate::{
-    arena::BadHandle, valid::ModuleInfo, ArraySize, FastHashMap, FunctionArgument, GlobalVariable,
-    Module,
+    arena::BadHandle,
+    valid::{GlobalUse, ModuleInfo},
+    AddressSpace, ArraySize, FastHashMap, FunctionArgument, GlobalVariable, Module,
 };
 use abc_helper::{self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, Predicate, Term};
 use log::info as log_info;
@@ -218,7 +215,7 @@ struct PartialFunctionSummary {
 
 /// Partial function summary is a function summary without a handle. The handle is added at the end.
 impl PartialFunctionSummary {
-    fn to_function_summary(self, handle: ConstraintHandle<abc_helper::Summary>) -> FunctionSummary {
+    fn into_function_summary(self, handle: ConstraintHandle<abc_helper::Summary>) -> FunctionSummary {
         FunctionSummary {
             expressions: self.expressions,
             arguments: self.arguments,
@@ -251,8 +248,8 @@ impl ops::Index<crate::Handle<crate::LocalVariable>> for PartialFunctionSummary 
 ///
 /// A function summary works as a bridge between the function in the module and the `Summary` in the helper.
 ///
-/// It can be indexed by an [`Expression`] handle to get the helper's `Term` corresponding to the expression.
-/// It can also be indexed by a [`LocalVariable`] handle to get the helper's `Term` corresponding to the local variable.
+/// It can be indexed by an [`Expression`] handle to get the helper's last `Term` that corresponds to the expression.
+/// It can also be indexed by a [`LocalVariable`] handle to get the helper's last `Term` corresponding to the local variable.
 ///
 /// The `handle` field
 pub struct FunctionSummary {
@@ -290,8 +287,8 @@ enum ExpressionOrLiteral {
 
 impl std::fmt::Display for ExpressionOrLiteral {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExpressionOrLiteral::Expression(e) => write!(f, "{}", e),
+        match *self {
+            ExpressionOrLiteral::Expression(ref e) => write!(f, "{}", e),
             ExpressionOrLiteral::Literal(l) => write!(f, "{}", l),
         }
     }
@@ -321,6 +318,37 @@ enum ResolvedAccess {
         inner: crate::TypeInner,
         dimension: usize,
     },
+}
+
+#[derive(Debug, Clone)]
+/// Maintains a map of the current symbols for local and global variables.
+struct BlockContext {
+    /// Holds local variables and whether or not they were modified in the context.
+    pub(self) local_variable_map: FastHashMap<crate::Handle<crate::LocalVariable>, (Term, bool)>,
+
+    /// Holds global variables and whether or not they were modified in the context.
+    pub(self) global_variable_map: FastHashMap<crate::Handle<GlobalVariable>, (Term, bool)>,
+}
+
+impl BlockContext {
+    /// Return a new BlockContext with the modified flag of all variables reset.
+    ///
+    /// Meant to be used to track blocks that modified variables so we know
+    /// how to update those variables.
+    pub(self) fn reset_writes(&self) -> Self {
+        let mut local_variable_map = self.local_variable_map.clone();
+        for (_, &mut (_, ref mut modified)) in local_variable_map.iter_mut() {
+            *modified = false;
+        }
+        let mut global_variable_map = self.global_variable_map.clone();
+        for (_, &mut (_, ref mut modified)) in global_variable_map.iter_mut() {
+            *modified = false;
+        }
+        BlockContext {
+            local_variable_map,
+            global_variable_map,
+        }
+    }
 }
 
 impl BoundsChecker {
@@ -375,9 +403,7 @@ impl BoundsChecker {
                     ))?;
                     my_map.insert(name, self.types[member.ty.index()].clone());
                 }
-                Ok(AbcType::Struct {
-                    members: my_map.into(),
-                })
+                Ok(AbcType::Struct { members: my_map })
             }
             _ => Err(BoundsCheckError::Unsupported(format!(
                 "Unsupported type: {:?}",
@@ -400,63 +426,28 @@ impl BoundsChecker {
         term: &T,
         space: &str,
     ) -> Result<Term, BoundsCheckError> {
-        let varname = match term.to_name() {
-            Some(name) => {
+        let varname = match *term.to_name() {
+            Some(ref name) => {
                 // Make the var
-                name.clone()
+                self.next_var_name(name)
             }
             None => {
-                let mut name = String::from("$anon_") + space;
-                name.push_str(&handle.index().to_string());
-                name
+                let name = String::from("$anon_") + space;
+                self.next_var_name(&name)
             }
         };
         let var = self
             .helper
-            .declare_var(abc_helper::Var {
-                name: varname.into(),
-            })
-            .map_err(|e| BoundsCheckError::ConstraintHelperError(e))?;
+            .declare_var(abc_helper::Var { name: varname })
+            .map_err(BoundsCheckError::ConstraintHelperError)?;
 
         // Mark the type of the variable
         let ty = self.types[term.to_type().index()].clone();
         self.helper
             .mark_type(var.clone(), ty)
-            .map_err(|e| BoundsCheckError::ConstraintHelperError(e))?;
+            .map_err(BoundsCheckError::ConstraintHelperError)?;
 
         Ok(var)
-    }
-
-    // Not sure if we need this...
-    fn expr_to_string(
-        &self,
-        expr: crate::Handle<crate::Expression>,
-        named: bool,
-        module: &Module,
-        mod_info: &ModuleInfo,
-        func: &crate::Function,
-    ) -> String {
-        use crate::Expression;
-        let built = String::new();
-        // If the expression is in NamedExpressions, use that...
-        if named {
-            if let Some(named) = func.named_expressions.get(&expr) {
-                return named.clone();
-            }
-        }
-        let expr = &func.expressions[expr];
-
-        match expr {
-            Expression::Access { base, index } => {
-                let base_str = self.expr_to_string(*base, true, module, mod_info, func);
-                let index_str = self.expr_to_string(*index, true, module, mod_info, func);
-                format!("{}[{}]", base_str, index_str)
-            }
-            Expression::FunctionArgument(idx) => {
-                format!("@arg{}", idx)
-            }
-            _ => format!("{:?}", expr),
-        }
     }
 
     /// Make a name for the expression.
@@ -480,21 +471,23 @@ impl BoundsChecker {
     ///
     /// # Panics
     /// If the counter for the variable is greater than u32::Max
-    fn next_var_name(&mut self, name: &String) -> String {
+    #[allow(clippy::panic)]
+    fn next_var_name(&mut self, name: &str) -> String {
         let counter = self.unique_counter.entry(name.to_string()).or_insert(0);
         if *counter == 0 {
-            return name.clone();
+            *counter += 1;
+            name.to_string()
         } else if *counter == u32::MAX {
             panic!("Variable counter overflow");
         } else {
             // name = name${cntr}
             // We use `$`` to avoid having to worry about variables that already have _1 in them in the source code.
             // As `$` is not a valid wgsl identifier.
-            *counter += 1;
             let mut s = String::with_capacity(name.len() + 2);
             s.push_str(name);
             s.push('$');
             s.push_str(&counter.to_string());
+            *counter += 1;
             s
         }
     }
@@ -518,10 +511,10 @@ impl BoundsChecker {
     ) -> Result<Term, BoundsCheckError> {
         use crate::proc::TypeResolution;
         let base_expr_info = &func_ctx.info[base_expr_handle].ty;
-        let (naga_ty, ref abc_ty) = match base_expr_info {
-            TypeResolution::Handle(ty) => (&module_info.module.types[*ty], self[*ty].clone()),
+        let (naga_ty, ref abc_ty) = match *base_expr_info {
+            TypeResolution::Handle(ty) => (&module_info.module.types[ty], self[ty].clone()),
             TypeResolution::Value(crate::TypeInner::Pointer { base, space }) => {
-                (&module_info.module.types[*base], self[*base].clone())
+                (&module_info.module.types[base], self[base].clone())
             }
             _ => {
                 return Err(BoundsCheckError::Unexpected(format!(
@@ -544,24 +537,24 @@ impl BoundsChecker {
             };
         }
 
-        match abc_ty.as_ref() {
+        match *abc_ty.as_ref() {
             AbcType::SizedArray { size, .. } => {
                 // Add the constraint that the index is less than the size
                 let index_literal: Term = as_expression!(index);
-                let size_literal: Term = Term::new_literal(*size);
+                let size_literal: Term = Term::new_literal(size);
                 // Note: We can optimize this later on by reusing the same literal for 0.
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
                     size_literal.clone(),
                     // The expression this comes from...
-                    &format!("{}[{}]", base_expr, index),
+                    abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
                     Term::new_literal(0),
-                    &format!("{}[{}]", base_expr, index),
+                    abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 // Make a new expression that is an access to the base and the index.
                 Ok(Term::new_index_access(
@@ -569,14 +562,14 @@ impl BoundsChecker {
                     index_literal.clone(),
                 ))
             }
-            AbcType::DynamicArray { ty } => {
+            AbcType::DynamicArray { ref ty } => {
                 let index_literal: Term = as_expression!(index);
                 let res = Term::new_index_access(base_expr.clone(), index_literal.clone());
                 self.helper.add_tracked_constraint(
                     index_literal.clone(),
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
                     Term::new_literal(0),
-                    &format!("{}[{}]", base_expr, &index),
+                    abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 // We need an expression for the array length..
                 let len_expression = self
@@ -587,16 +580,16 @@ impl BoundsChecker {
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
                     // todo: fix this.
                     len_expression,
-                    &format!("{}[{}]", base_expr, index),
+                    abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 Ok(res)
             }
-            AbcType::Struct { members } => {
+            AbcType::Struct { ref members } => {
                 if let ExpressionOrLiteral::Literal(l) = index {
                     Ok(Term::new_struct_access(
                         base_expr.clone(),
-                        match &naga_ty.inner {
-                            crate::TypeInner::Struct { members, .. } => {
+                        match naga_ty.inner {
+                            crate::TypeInner::Struct { ref members, .. } => {
                                 let member = &members[l as usize];
                                 member.name.clone().unwrap()
                             }
@@ -620,12 +613,10 @@ impl BoundsChecker {
             }
 
             #[allow(unreachable_patterns)]
-            _ => {
-                return Err(BoundsCheckError::Unsupported(format!(
-                    "AccessIndex with {:?} as a base type.",
-                    abc_ty
-                )));
-            }
+            _ => Err(BoundsCheckError::Unsupported(format!(
+                "AccessIndex with {:?} as a base type.",
+                abc_ty
+            ))),
         }
     }
 
@@ -639,16 +630,12 @@ impl BoundsChecker {
         expr_handle: crate::Handle<crate::Expression>,
         func_ctx: &FunctionWithInfo,
         func_summary: &mut PartialFunctionSummary,
+        block_context: &BlockContext,
     ) -> Result<Term, BoundsCheckError> {
         // If the expression has already been visited, we just return a handle to it.
         if let Some(e) = func_summary.expressions.get(&expr_handle) {
             return Ok(e.clone());
         }
-        // It's probably an error if we have an expression that is visited a second time in an Emit, right?
-        // Because an emit would end up changing the scope...
-        // As in, if we had a load(x) and then we saw emit, then the expressions therein need to be named.
-        // Otherwise, we need to visit the expression.
-        // We'll mark the type of the expression as we go.
         let expr = &func_ctx.func.expressions[expr_handle];
         log_info!("Visiting expression: {:?}", expr);
 
@@ -661,33 +648,35 @@ impl BoundsChecker {
 
         let expr_info = &func_ctx.info[expr_handle];
 
-        let resolved: Term = match expr {
+        let resolved: Term = match *expr {
             Expr::Splat { size, value } => Term::new_splat(
-                self.visit_expr(module_info, *value, func_ctx, func_summary)?,
-                (*size).into(),
+                self.visit_expr(module_info, value, func_ctx, func_summary, block_context)?,
+                (size) as u32,
             ),
             // For right now, when we see load, we should just return the variable bound to the inner...
             // Although, for 'store', this really needs to mark the current variable name...
             // A 'load' should get the most recent variable name of the expression it is loading from...
             Expr::Load { pointer } => {
-                // We will make a new expression holding the value of the thing being loaded from...
-                self.visit_expr(module_info, *pointer, func_ctx, func_summary)?
-                // When we load, we should use the last SSA variable name.
+                self.visit_expr(module_info, pointer, func_ctx, func_summary, block_context)?
             }
-            Expr::Literal(lit) => Term::new_literal(lit.to_string()),
-            Expr::Constant(c) => self[*c].clone(),
-            Expr::Override(o) => self[*o].clone(),
-            Expr::FunctionArgument(idx) => func_summary.arguments[*idx as usize].clone(),
+            Expr::Literal(lit) => lit.into(),
+            Expr::Constant(c) => self[c].clone(),
+            Expr::Override(o) => self[o].clone(),
+            Expr::FunctionArgument(idx) => func_summary.arguments[idx as usize].clone(),
             Expr::Binary { op, left, right } => {
-                let left = self.visit_expr(module_info, *left, func_ctx, func_summary)?;
-                let right = self.visit_expr(module_info, *right, func_ctx, func_summary)?;
-                Self::binary_to_abc_expression(*op, left, right)?
+                let left =
+                    self.visit_expr(module_info, left, func_ctx, func_summary, block_context)?;
+                let right =
+                    self.visit_expr(module_info, right, func_ctx, func_summary, block_context)?;
+                Self::binary_to_abc_expression(op, left, right)?
             }
             Expr::Access { base, index, .. } => {
-                let new_base = self.visit_expr(module_info, *base, func_ctx, func_summary)?;
-                let new_index = self.visit_expr(module_info, *index, func_ctx, func_summary)?;
+                let new_base =
+                    self.visit_expr(module_info, base, func_ctx, func_summary, block_context)?;
+                let new_index =
+                    self.visit_expr(module_info, index, func_ctx, func_summary, block_context)?;
                 self.make_access(
-                    *base,
+                    base,
                     new_base,
                     ExpressionOrLiteral::Expression(new_index),
                     module_info,
@@ -697,11 +686,12 @@ impl BoundsChecker {
             // We should mark the type of the pointer
             // Expr::FunctionArgument(idx) => func_ctx.arguments[*idx as usize].clone(),
             Expr::AccessIndex { base, index } => {
-                let new_base = self.visit_expr(module_info, *base, func_ctx, func_summary)?;
+                let new_base =
+                    self.visit_expr(module_info, base, func_ctx, func_summary, block_context)?;
                 self.make_access(
-                    *base,
+                    base,
                     new_base,
-                    ExpressionOrLiteral::Literal(*index),
+                    ExpressionOrLiteral::Literal(index),
                     module_info,
                     func_ctx,
                 )?
@@ -711,17 +701,17 @@ impl BoundsChecker {
                 kind: s,
                 convert: b,
             } => {
-                let a = self.visit_expr(module_info, *a, func_ctx, func_summary)?;
+                let a = self.visit_expr(module_info, a, func_ctx, func_summary, block_context)?;
                 use crate::ScalarKind;
                 match (s, b) {
                     (ScalarKind::Sint, Some(b)) => {
-                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Sint(*b))
+                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Sint(b))
                     }
                     (ScalarKind::Uint, Some(b)) => {
-                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Uint(*b))
+                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Uint(b))
                     }
                     (ScalarKind::Float, Some(b)) => {
-                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Float(*b))
+                        Term::new_cast(a.clone(), abc_helper::AbcScalar::Float(b))
                     }
                     (ScalarKind::Bool, _) => Term::new_unit_pred(a),
                     _ => {
@@ -732,16 +722,23 @@ impl BoundsChecker {
                     }
                 }
             }
-            Expr::GlobalVariable(g) => self[*g].clone(),
-            Expr::LocalVariable(l) => func_summary[*l].clone(),
-            Expr::CallResult(c) => {
+            Expr::GlobalVariable(ref g) => {
+                // If the term exists in our global variable map, then we use that.
+                if let Some(&(ref term, _)) = block_context.global_variable_map.get(g) {
+                    term.clone()
+                } else {
+                    self[*g].clone()
+                }
+            }
+            Expr::LocalVariable(ref l) => block_context.local_variable_map[l].0.clone(),
+            Expr::CallResult(ref c) => {
                 return Err(BoundsCheckError::Unexpected(
                     "Attempted to visit a call result.".to_string(),
                 ))
             }
             _ => {
                 return Err(BoundsCheckError::Unsupported(
-                    "Unsupported expression type: ".to_owned() + expression_variant!(expr),
+                    "Unsupported expression type: ".to_owned() + expression_variant!(*expr),
                 ));
             }
         };
@@ -757,7 +754,7 @@ impl BoundsChecker {
                 self.helper.add_constraint(
                     expr_var_name.clone(),
                     abc_helper::ConstraintOp::Assign,
-                    resolved.into(),
+                    resolved,
                 )?;
 
                 // TODO: Figure out if we need to mark the type of the expression?
@@ -779,172 +776,509 @@ impl BoundsChecker {
         // Ok(())
     }
 
+    /// Visit a store statement; used exclusively by [`visit_statement`], but extracted to its own
+    /// method to improve readability.
+    ///
+    ///
+    /// When we see a store, we have to deal with SSA renaming.
+    /// Luckily, WGSL has some restrictions about aliases that reduce the complexity of stores.
+    ///
+    /// When we see a store, we tell the constraint helper that we need a new variable.
+    /// We then add an assumption that the new variable's value is equal to the value being stored.
+    ///
+    /// Then, we update an internal map that maps handles to Local and Global variables (the only things that can be modified)
+    /// to point to this new term we requested from the constraint helper.
+    ///
+    /// All `Load` expressions actually refer to this map to determine which term they resolve to.
+    /// That is, if we see something like this:
+    /// ```wgsl
+    /// var a = 4
+    /// a = a + 1
+    /// b = 2*a
+    /// ```
+    /// Then that would look like this in our constraint system:
+    ///```wgsl
+    /// a = 4
+    /// a_1 = a + 1  // At this line, we would update our internal map for a.
+    /// b = 2*a_1
+    ///```
+    ///
+    /// [`visit_statement`]: Self::visit_statement
+    #[allow(clippy::too_many_arguments)]
+    fn visit_store(
+        &mut self,
+        module: &ModuleWithInfo,
+        func_ctx: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        block_ctx: &mut BlockContext,
+        pointer: &crate::Handle<crate::Expression>,
+        value: &crate::Handle<crate::Expression>,
+    ) -> Result<(), BoundsCheckError> {
+        use crate::proc::TypeResolution as KIND;
+        use crate::Expression as E;
+        use crate::TypeInner;
+        // Figure out what the pointer ultimately points to.
+        let mut current = *pointer;
+        // Visit the pointer and the value.
+        let pointer_term = self.visit_expr(module, *pointer, func_ctx, func_summary, block_ctx)?;
+        let mut value = self.visit_expr(module, *value, func_ctx, func_summary, block_ctx)?;
+        // Until we reach the base expression being pointed to, we continually loop to build the value we are writing to.
+        loop {
+            // We have to remove, from the function summary, any expression we are about to overwrite, if it exists, so that we don't use stale information.
+            func_summary.expressions.remove(&current);
+            match func_ctx.func.expressions[current] {
+                E::AccessIndex { base, index } => {
+                    // Naga allows AccessIndex to correspond to either a struct, or an array with a constant offset.
+                    // Unfortunately, this complicates how we have to handle access index expressions.
+                    // Here, ty_inner represents the type of expression behind the pointer.
+                    // We expect this to be a pointer. So if it isn't, we reject it.
+                    let ty_inner = match func_ctx.info[current].ty {
+                        KIND::Handle(ref ty) => match &module.module.types[*ty].inner {
+                            &crate::TypeInner::Pointer { ref base, .. } => Some(base),
+                            &crate::TypeInner::ValuePointer {
+                                ref size,
+                                ref scalar,
+                                ref space,
+                            } => Some(ty),
+                            e => {
+                                break Err(BoundsCheckError::Unsupported(format!(
+                                    "Store to a non pointer type: {:?}.",
+                                    e
+                                )));
+                            }
+                        },
+                        KIND::Value(ref ty) => match ty {
+                            &crate::TypeInner::Pointer { ref base, .. } => Some(base),
+                            &crate::TypeInner::ValuePointer { .. } => None,
+                            e => {
+                                break Err(BoundsCheckError::Unsupported(format!(
+                                    "Store to a non pointer type: {:?}.",
+                                    e
+                                )));
+                            }
+                        },
+                    };
+                    let module_ty = ty_inner.map(|f| &module.module.types[*f].inner);
+                    // Now that we know whether the expression corresponds to a struct assignment or a field access,
+                    // we can match the type of the struct.
+                    match module_ty {
+                        Some(&TypeInner::Struct { ref members, .. }) => {
+                            value = Term::new_struct_store(
+                                func_summary[base].clone(),
+                                // unwrap is okay as we have already rejected struct members with no name.
+                                members[index as usize].name.clone().unwrap(),
+                                // unwrap unchecked is OK here since module_ty cannot be Some if ty_inner is None.
+                                self[unsafe { *ty_inner.unwrap_unchecked() }].clone(),
+                                value.clone(),
+                            )
+                        }
+                        _ => {
+                            value = Term::new_store(
+                                func_summary[base].clone(),
+                                index.into(),
+                                value.clone(),
+                            )
+                        }
+                    }
+                    current = base;
+                }
+                E::Access { base, index } => {
+                    value = Term::new_store(
+                        func_summary[base].clone(),
+                        func_summary[index].clone(),
+                        value.clone(),
+                    );
+                    current = base;
+                }
+                E::GlobalVariable(g) if !block_ctx.global_variable_map.contains_key(&g) => {
+                    // If the global variable does not appear in our map, then we do not mark the assumption.
+                    // This allows us to be pessimistic about the domain of global variables that
+                    // may have been written to by other blocks / threads.
+                    // TODO: figure out if we want to actually issue a constraint against the original global variable.
+                    break Ok(());
+                }
+                E::LocalVariable(l) => {
+                    // Get a new term for the var.
+                    let new_term = self.mark_var(l, &func_ctx.func.local_variables[l], "local")?;
+                    self.helper.add_assumption(
+                        new_term.clone(),
+                        abc_helper::ConstraintOp::Assign,
+                        value.clone(),
+                    )?;
+                    block_ctx.local_variable_map.insert(l, (new_term, true));
+                    break Ok(());
+                }
+                E::GlobalVariable(g) => {
+                    // Get a new term for the var.
+                    let new_term =
+                        self.mark_var(g, &module.module.global_variables[g], "global")?;
+                    self.helper.add_assumption(
+                        new_term.clone(),
+                        abc_helper::ConstraintOp::Assign,
+                        value.clone(),
+                    )?;
+                    block_ctx.global_variable_map.insert(g, (new_term, true));
+                    break Ok(());
+                }
+                E::FunctionArgument(a) => {
+                    break Err(BoundsCheckError::Unsupported(
+                        "Store to a function argument".to_string(),
+                    ));
+                }
+                _ => {
+                    unreachable!(
+                        "Store statement with a pointer type that is not Access,\
+                        AccessIndex, LocalVariable, GlobalVariable, or FunctionArgument"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Visit a loop statement. Used exclusively by [`visit_statement`], but extracted to its own
+    /// method to improve readability.
+    ///
+    /// [`visit_statement`]: Self::visit_statement
+    #[allow(clippy::too_many_arguments)]
+    fn visit_loop(
+        &mut self,
+        module: &ModuleWithInfo,
+        func_ctx: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        block_ctx: &mut BlockContext,
+        body: &crate::Block,
+        continuing: &crate::Block,
+        break_if: &Option<crate::Handle<crate::Expression>>,
+    ) -> Result<(), BoundsCheckError> {
+        use crate::Expression as E;
+        use crate::Statement as S;
+        if break_if.is_some() {
+            return Err(BoundsCheckError::Unsupported(
+                "Loop with a non empty break_if".to_string(),
+            ));
+        }
+        if body.is_empty() {
+            return Err(BoundsCheckError::Unsupported(
+                "Loop with an empty body".to_string(),
+            ));
+        }
+        // we want an iterator over body
+        let mut body_iter = body.into_iter().peekable();
+        // Go through all of the emits.
+
+        while let Some(&&S::Emit(ref r)) = body_iter.peek() {
+            // iterate through the expressions in r
+            for e in r.clone() {
+                self.visit_expr(module, e, func_ctx, func_summary, block_ctx)?;
+            }
+            body_iter.next();
+        }
+        // We expect to see an If (condition) { {}; break; } structure.
+        // This indicates that this is a traditional loop.
+        // Otherwise, this is the `do-while` loop form that, well, we just don't
+        match body_iter.next() {
+            Some(&S::If {
+                ref condition,
+                ref accept,
+                ref reject,
+            }) if matches!(reject.first(), Some(&S::Break)) && accept.is_empty() => {
+                // Reject must be of len 1 with a single statement that is a break.
+                let condition =
+                    self.visit_expr(module, *condition, func_ctx, func_summary, block_ctx)?;
+                self.helper.begin_loop(condition)?;
+            }
+            Some(s) => {
+                return Err(BoundsCheckError::Unsupported(format!(
+                    "Unsupported loop structure, expecting If have {}",
+                    statement_variant!(*s)
+                )))
+            }
+            None => {
+                return Err(BoundsCheckError::Unsupported(
+                    "Loop with an empty body".to_string(),
+                ));
+            }
+        }
+        // Now that we have gotten the loop structure out of the way, we can visit the rest of the statements.
+        for smt in body_iter {
+            self.visit_statement(smt, module, func_ctx, func_summary, block_ctx)?;
+        }
+        for stmt in continuing {
+            self.visit_statement(stmt, module, func_ctx, func_summary, block_ctx)?;
+        }
+        self.helper.end_loop()?;
+        Ok(())
+    }
+
+    /// Visit a call statement. Used exclusively by [`visit_statement`], but extracted to its own
+    /// method to improve readability.
+    ///
+    /// [`visit_statement`]: Self::visit_statement
+    #[allow(clippy::too_many_arguments)]
+    fn visit_call(
+        &mut self,
+        module: &ModuleWithInfo,
+        func_ctx: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        block_ctx: &mut BlockContext,
+        function: &crate::Handle<crate::Function>,
+        arguments: &Vec<crate::Handle<crate::Expression>>,
+        result: &Option<crate::Handle<crate::Expression>>,
+    ) -> Result<(), BoundsCheckError> {
+        // Start by getting the function we are invoking, so that we error early if the function hasn't been looked at yet.
+        let called_func =
+            self.functions
+                .get(function.index())
+                .ok_or(BoundsCheckError::Unexpected(
+                    "Reference to a function that has not been declared.".to_string(),
+                ))?;
+        let handle = called_func.handle.clone();
+        // Using collect looks cleaner, but it's slower since we know the capacity of the vector.
+        let mut args = Vec::with_capacity(arguments.len());
+        for arg in arguments {
+            let arg = self.visit_expr(module, *arg, func_ctx, func_summary, block_ctx)?;
+            args.push(arg);
+        }
+
+        if let &Some(result) = result {
+            // If there is a result, we store the handle to expression that lets us refer to it.
+            let result_name = self.expr_to_name(result, func_ctx.func);
+            let var = self
+                .helper
+                .declare_var(abc_helper::Var { name: result_name })?;
+            func_summary
+                .expressions
+                .insert(result, self.helper.make_call(handle, args, Some(var))?);
+        } else {
+            // If there is no result, we just make the call.
+            self.helper.make_call(handle, args, None)?;
+        };
+
+        Ok(())
+    }
+
+    /// Does if-else updating of the context map, for either global variables or local variables.
+    ///
+    /// This iterates through each of the handles to variables in the context map, and replaces them with
+    /// new terms if they were updated in either the accept block or the reject block.
+    ///
+    /// There are four cases:
+    /// 1. The variable was modified in both the accept and reject blocks. The new term is then `select(condition, accept, reject)`
+    /// 2. The variable was modified in the accept block only. The new term is then `select(condition, accept, old)`
+    /// 3. The variable was modified in the reject block only. The new term is then `select(condition, old, reject)`
+    /// 4. The variable was not modified in either block. The term is left as is.
+    ///
+    /// Any terms that are modified are marked as such in the context map.
+    /// Context map itself will hold the new terms.
+    /// # Arguments
+    /// - `accept_map` Map of variables that may have been modified in the accept block
+    /// - `reject_map` Map of variables that may have been modified in the reject block
+    /// - `context_map` Map of variables in the current block context (prior to the accept / reject block evaluation)
+    /// - `condition` The condition for the `if` statement
+    /// - `arena` The arena where the local / global variable exists in the module.
+    fn update_if_else<T: HasName + HasType>(
+        &mut self,
+        accept_map: &mut FastHashMap<crate::Handle<T>, (Term, bool)>,
+        reject_map: &mut FastHashMap<crate::Handle<T>, (Term, bool)>,
+        context_map: &mut FastHashMap<crate::Handle<T>, (Term, bool)>,
+        condition: &Term,
+        arena: &crate::arena::Arena<T>,
+        space: &str,
+    ) -> Result<(), BoundsCheckError> {
+        for (handle, &mut (ref mut old_term, ref mut old_update)) in context_map.iter_mut() {
+            // if we modified it in both blocks, then we make this a select.
+            let (accept_term, accept_modified) =
+                accept_map
+                    .remove(handle)
+                    .ok_or(BoundsCheckError::Unexpected(
+                        "Missing ".to_string() + space + " variable",
+                    ))?;
+            let (reject_term, reject_modified) =
+                reject_map
+                    .remove(handle)
+                    .ok_or(BoundsCheckError::Unexpected(
+                        "Missing ".to_string() + space + " variable",
+                    ))?;
+            if !(accept_modified || reject_modified) {
+                continue;
+            }
+            // Create the new var so we can assign to it.
+            let new_var = self.mark_var(*handle, &arena[*handle], space)?;
+            *old_term = new_var.clone();
+            *old_update = true;
+            let new_term = match (accept_modified, reject_modified) {
+                (true, true) => Term::new_select(condition.clone(), accept_term, reject_term),
+                (true, false) => Term::new_select(condition.clone(), accept_term, old_term.clone()),
+                (false, true) => Term::new_select(condition.clone(), old_term.clone(), reject_term),
+                _ => {
+                    // This should be unreachable.
+                    unreachable!();
+                }
+            };
+            // Add the assumption that the new term is equal to the value of the variable.
+            self.helper.add_assumption(
+                new_var.clone(),
+                abc_helper::ConstraintOp::Assign,
+                new_term.clone(),
+            )?;
+        }
+        Ok(())
+    }
+    /// Visit an `If` statement. Used exclusively by [`visit_statement`], but extracted to its own
+    /// method to improve readability.
+    ///
+    /// [`visit_statement`]: Self::visit_statement
+    #[allow(clippy::too_many_arguments)]
+    fn visit_if(
+        &mut self,
+        module: &ModuleWithInfo,
+        func_ctx: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        block_ctx: &mut BlockContext,
+        condition: &crate::Handle<crate::Expression>,
+        accept: &crate::Block,
+        reject: &crate::Block,
+    ) -> Result<(), BoundsCheckError> {
+        let condition = self.visit_expr(module, *condition, func_ctx, func_summary, block_ctx)?;
+        // We need two fresh block contexts with the write set reset.
+        let accept_ctx = &mut block_ctx.reset_writes();
+        let reject_ctx = &mut accept_ctx.clone();
+
+        if !accept.is_empty() {
+            self.helper.begin_predicate_block(condition.clone())?;
+            // Now, before we visit the b
+            self.visit_block(accept, module, func_ctx, func_summary, accept_ctx)?;
+            self.helper.end_predicate_block()?;
+        }
+        if !reject.is_empty() {
+            self.helper
+                .begin_predicate_block(Term::new_not(condition.clone()))?;
+            self.visit_block(reject, module, func_ctx, func_summary, reject_ctx)?;
+            self.helper.end_predicate_block()?;
+        }
+
+        //
+        #[allow(clippy::pattern_type_mismatch)]
+        let &mut BlockContext {
+            local_variable_map: ref mut accept_locals,
+            global_variable_map: ref mut accept_globals,
+        } = accept_ctx;
+        let &mut BlockContext {
+            local_variable_map: ref mut reject_locals,
+            global_variable_map: ref mut reject_globals,
+        } = reject_ctx;
+        // Now we update the block context with the new writes.
+        // We use a select expression here.
+        // We need to repeat this for both the local and global variables...
+        self.update_if_else(
+            accept_locals,
+            reject_locals,
+            &mut block_ctx.local_variable_map,
+            &condition,
+            &func_ctx.func.local_variables,
+            "local",
+        )?;
+        self.update_if_else(
+            accept_globals,
+            reject_globals,
+            &mut block_ctx.global_variable_map,
+            &condition,
+            &module.module.global_variables,
+            "global",
+        )?;
+
+        Ok(())
+    }
     fn visit_statement(
         &mut self,
         stmt: &crate::Statement,
         module: &ModuleWithInfo,
         func_ctx: &FunctionWithInfo,
         func_summary: &mut PartialFunctionSummary,
-        block_ctx: Option<&crate::Block>,
+        block_ctx: &mut BlockContext,
     ) -> Result<bool, BoundsCheckError> {
-        use crate::Statement;
-        match stmt {
-            Statement::Loop {
+        use crate::Expression as E;
+        use crate::Statement as S;
+        match *stmt {
+            S::Loop {
+                ref body,
+                ref continuing,
+                ref break_if,
+            } => self.visit_loop(
+                module,
+                func_ctx,
+                func_summary,
+                block_ctx,
                 body,
                 continuing,
                 break_if,
+            )?,
+            S::Emit(ref r) => {
+                // An emit with a load on a local variable..?
+                // Do we see this more than once?
+                for e in r.clone() {
+                    self.visit_expr(module, e, func_ctx, func_summary, block_ctx)?;
+                }
+            }
+            S::Call {
+                ref function,
+                ref arguments,
+                ref result,
             } => {
-                if break_if.is_some() {
-                    return Err(BoundsCheckError::Unsupported(
-                        "Loop with a non empty break_if".to_string(),
-                    ));
-                }
-                if body.len() == 0 {
-                    return Err(BoundsCheckError::Unsupported(
-                        "Loop with an empty body".to_string(),
-                    ));
-                }
-                // we want an iterator over body
-                let mut body_iter = body.into_iter().peekable();
-                // Go through all of the emits.
-
-                while let Some(Statement::Emit(ref r)) = body_iter.peek() {
-                    // iterate through the expressions in r
-                    for e in r.clone().into_iter() {
-                        self.visit_expr(module, e, func_ctx, func_summary)?;
-                    }
-                    body_iter.next();
-                }
-                // We expect to see an If (condition) { {}; break; } structure.
-                // This indicates that this is a traditional loop.
-                // Otherwise, this is the `do-while` loop form that, well, we just don't
-                match body_iter.next() {
-                    Some(Statement::If {
-                        condition,
-                        accept,
-                        reject,
-                    }) if matches!(reject.get(0), Some(Statement::Break)) && accept.len() == 0 => {
-                        // Accept must be of len 1 with a single statement that is a break.
-                        let condition =
-                            self.visit_expr(module, *condition, func_ctx, func_summary)?;
-                        self.helper.begin_loop(condition)?;
-                    },
-                    Some(s) => 
-                        return Err(BoundsCheckError::Unsupported(
-                            format!(
-                                "Unsupported loop structure, expecting If have {}", statement_variant!(s)
-                            )
-                        )),
-                    None => {
-                        return Err(BoundsCheckError::Unsupported(
-                            "Loop with an empty body".to_string(),
-                        ));
-                    }
-                }
-                // Now that we have gotten the loop structure out of the way, we can visit the rest of the statements.
-                for smt in body_iter {
-                    self.visit_statement(smt, module, func_ctx, func_summary, block_ctx)?;
-                }
-                for stmt in continuing {
-                    self.visit_statement(stmt, module, func_ctx, func_summary, block_ctx)?;
-                }
-
+                self.visit_call(
+                    module,
+                    func_ctx,
+                    func_summary,
+                    block_ctx,
+                    function,
+                    arguments,
+                    result,
+                )?;
             }
-            Statement::Emit(ref r) => {
-                for e in r.clone().into_iter() {
-                    self.visit_expr(module, e, func_ctx, func_summary)?;
-                }
-            }
-            Statement::Call {
-                function,
-                arguments,
-                result,
-            } => {
-                // Start by getting the function we are invoking, so that we error early if the function hasn't been looked at yet.
-                let called_func =
-                    self.functions
-                        .get(function.index())
-                        .ok_or(BoundsCheckError::Unexpected(
-                            "Reference to a function that has not been declared.".to_string(),
-                        ))?;
-                let handle = called_func.handle.clone();
-                // Using collect looks cleaner, but it's slower since we know the capacity of the vector.
-                let mut args = Vec::with_capacity(arguments.len());
-                for arg in arguments {
-                    let arg = self.visit_expr(module, *arg, func_ctx, func_summary)?;
-                    args.push(arg);
-                }
-
-                let res_into = if let Some(result) = result {
-                    // If there is a result, we store the handle to expression that lets us refer to it.
-                    let result_name = self.expr_to_name(*result, func_ctx.func);
-                    let var = self
-                        .helper
-                        .declare_var(abc_helper::Var { name: result_name })?;
-                    func_summary
-                        .expressions
-                        .insert(*result, self.helper.make_call(handle, args, Some(var))?);
-                } else {
-                    // If there is no result, we just make the call.
-                    self.helper.make_call(handle, args, None)?;
-                };
-
-                // Then we add a constraint tht the result equals the call.
-            }
-            Statement::Return { value: Some(v) } => {
+            S::Return { value: Some(v) } => {
                 // Visit the containing expression.
-                let expr = self.visit_expr(module, *v, func_ctx, func_summary)?;
+                let expr = self.visit_expr(module, v, func_ctx, func_summary, block_ctx)?;
                 // These variables were assigned to in the block.
                 self.helper.mark_return(Some(expr))?;
                 return Ok(false);
             }
-            Statement::Return { value: None } => {
+            S::Return { value: None } => {
                 self.helper.mark_return(None)?;
                 // When we get to a return, we stop processing all statements in the block.
                 return Ok(false);
             }
-            Statement::Break => {
+            S::Break => {
                 // If the block context is a loop, then we immediately stop processing more elements in the block.
                 self.helper.mark_break()?;
                 return Ok(false);
             }
-            Statement::Continue => {
+            S::Continue => {
                 self.helper.mark_continue()?;
                 return Ok(false);
             }
-            Statement::If {
-                condition,
-                accept,
-                reject,
+            S::If {
+                ref condition,
+                ref accept,
+                ref reject,
             } => {
-                let condition = self.visit_expr(module, *condition, func_ctx, func_summary)?;
-                if accept.len() > 0 {
-                    self.helper.begin_predicate_block(condition.clone())?;
-                    self.visit_block(accept, module, func_ctx, func_summary, block_ctx)?;
-                    self.helper.end_predicate_block()?;
-                }
-                if reject.len() > 0 {
-                    self.helper
-                        .begin_predicate_block(Term::new_not(condition))?;
-                    self.visit_block(reject, module, func_ctx, func_summary, block_ctx)?;
-                    self.helper.end_predicate_block()?;
-                }
+                self.visit_if(
+                    module,
+                    func_ctx,
+                    func_summary,
+                    block_ctx,
+                    condition,
+                    accept,
+                    reject,
+                )?;
             }
-            Statement::Store { pointer, value } => {
-                // If whatever expression we are storing to has a name, then we use that name.
-                // When we see a store, we actually mark the term that we loaded from with the next name.
-                let pointer = self.visit_expr(module, *pointer, func_ctx, func_summary)?;
-                let value = self.visit_expr(module, *value, func_ctx, func_summary)?;
-                // TODO: Figure out if we need to increment the identifer for the pointer.
-                self.helper
-                    .add_constraint(pointer, abc_helper::ConstraintOp::Assign, value)?;
+            S::Store { pointer, value } => {
+                // The logic here is complex, so it has been extracted to its own function to improve readability.
+                self.visit_store(module, func_ctx, func_summary, block_ctx, &pointer, &value)?;
             }
-            Statement::Block(ref b) => {
-                self.visit_block(b, module, func_ctx, func_summary, block_ctx)?
-            }
+            S::Block(ref b) => self.visit_block(b, module, func_ctx, func_summary, block_ctx)?,
             _ => {
                 return Err(BoundsCheckError::Unsupported(
-                    "Unsupported statement type: ".to_owned() + statement_variant!(stmt),
+                    "Unsupported statement type: ".to_owned() + statement_variant!(*stmt),
                 ));
             }
         }
@@ -957,14 +1291,14 @@ impl BoundsChecker {
         module: &ModuleWithInfo,
         func_ctx: &FunctionWithInfo,
         func_summary: &mut PartialFunctionSummary,
-        block_ctx: Option<&crate::Block>,
+        block_ctx: &mut BlockContext,
     ) -> Result<(), BoundsCheckError> {
         use crate::Statement;
         // Function info...
         for stmt in block.iter() {
             // If visit_statement returns false, that means we hit control flow and should stop processing more
             // elements in the block (e.g, we hit a `break`/`return`/`continue`).
-            if ! self.visit_statement(stmt, module, func_ctx, func_summary, Some(block))? {
+            if !self.visit_statement(stmt, module, func_ctx, func_summary, block_ctx)? {
                 break;
             }
         }
@@ -972,12 +1306,35 @@ impl BoundsChecker {
         Ok(())
     }
 
+    /// Check function will add terms and constraints from the body of the function.
+    ///
+    /// Local variables are maintained in a map that tracks which blocks have written to them.
+    ///
+    /// This allows us to do strict SSA renaming for local variables.
+    ///
+    /// The restrictions on WGSL mean that we can never have more than one pointer to the same memory location
+    /// where multiple of them are writes.
+    /// This is because pointers to pointers are not allowed. So while local variables can be pointers,
+    /// they can never break ssa.
+    ///
+    /// So, to check a module, we begin by marking all of the local variables and their types.
+    /// This interacts with abc_helper to mark the variables in the constraint system.
+    ///
+    /// Next, we mark the return type of th function.
+    ///
+    /// Then, we go build the `block_ctx` struct that is used for SSA renaming.
+    /// When a local variable or global variable is written to, we create a new variable in the constraint system
+    /// and update our `block_ctx` to point to the new term.
+    ///
+    /// Any expression referencing a local or global variable will use this new term.
+    /// Naga guarantees that any use of the variable that was stored to will have a new load expression reissued.
+    /// This fact makes our analysis dramatically easier.
     fn check_function(
         &mut self,
         module: &ModuleWithInfo,
         func: &FunctionWithInfo,
         func_summary: &mut PartialFunctionSummary,
-        name: &String,
+        name: &str,
     ) -> Result<(), BoundsCheckError> {
         let func_info = func.info;
         // Exit early if the function can kill, as this isn't supported.
@@ -987,18 +1344,60 @@ impl BoundsChecker {
             ));
         }
 
+        // Go through local variables...
+        let mut local_variable_map: FastHashMap<crate::Handle<crate::LocalVariable>, (Term, bool)> =
+            FxHashMap::with_capacity_and_hasher(func.func.local_variables.len(), Default::default());
         for (var_handle, var) in func.func.local_variables.iter() {
             let var = self.mark_var(var_handle, var, name)?;
-            func_summary.local_variabes.push(var);
+            func_summary.local_variabes.push(var.clone());
+            local_variable_map.insert(var_handle, (var, false));
         }
 
-        // begin the summary.
         if let Some(crate::FunctionResult { ty, .. }) = func.func.result {
             let ty = self[ty].clone();
             self.helper.mark_return_type(ty)?;
         }
 
-        self.visit_block(&func.func.body, module, func, func_summary, None)?;
+        let mut global_variable_map: FastHashMap<crate::Handle<GlobalVariable>, (Term, bool)> =
+            FxHashMap::with_capacity_and_hasher(
+                func_info.global_variable_count(),
+                Default::default(),
+            );
+        for (handle, var) in module.module.global_variables.iter() {
+            // Here, *any* reads from a global variable in the shared space *must* be marked as killed by the invocation
+            // if the function writes to the global variable.
+            if let AddressSpace::Storage { access } = var.space {
+                if access.contains(crate::StorageAccess::STORE)
+                    && func_info[handle].intersects(GlobalUse::READ | GlobalUse::WRITE)
+                {
+                    // We do not add these terms to the global variable map.
+                    // When evaluating expressions, when we see a global variable that is not in the global variable map,
+                    // Then we know not to issue a constraint for the write.
+                    // This ensures the variable is never renamed.
+
+                    // We could maybe be smarter about this by determining the uniformity of the writes to the global variable,
+                    // but there are complexities in doing this for buffer like variables.
+                    continue;
+                }
+            }
+            global_variable_map.insert(handle, (self[handle].clone(), false));
+        }
+
+        self.visit_block(
+            &func.func.body,
+            module,
+            func,
+            func_summary,
+            &mut BlockContext {
+                local_variable_map,
+                global_variable_map,
+            },
+        )?;
+
+        // Now, any global variables that have *write* usage will be marked as 'used' by this function.
+        // That way, when we call a function, we can add the information as to which globals were written to there.
+
+        // Now, we need to mark the global uses for this function's ctx.
 
         // End the summary
 
@@ -1024,9 +1423,9 @@ impl BoundsChecker {
         use abc_helper::BinaryOp;
         use abc_helper::CmpOp;
         use abc_helper::Predicate;
-        if let Some(binop) = op.try_into().ok() {
+        if let Ok(binop) = op.try_into() {
             Ok(Term::new_binary_op(binop, lhs, rhs))
-        } else if let Some(cmpop) = op.try_into().ok() {
+        } else if let Ok(cmpop) = op.try_into() {
             Ok(Term::new_comparison(cmpop, lhs, rhs))
         } else {
             match op {
@@ -1066,23 +1465,22 @@ impl BoundsChecker {
 
         // It's annoying because naga's decision to use handles means we have to write
         // this logic twice. Once for the global expressions and once for the function expressions.
-        let res: Term = match expr {
-            Expr::Literal(t) => Term::new_literal(format!("{t}")),
-            Expr::Constant(c) => self[*c].clone(),
+        let res: Term = match *expr {
+            Expr::Literal(t) => t.into(),
+            Expr::Constant(c) => self[c].clone(),
             Expr::Binary { op, left, right } => {
-                let left = self.global_expression_resolution(*left, module)?;
-                let right = self.global_expression_resolution(*right, module)?;
-                Self::binary_to_abc_expression(*op, left, right)?
+                let left = self.global_expression_resolution(left, module)?;
+                let right = self.global_expression_resolution(right, module)?;
+                Self::binary_to_abc_expression(op, left, right)?
                 // A binary op with a boolean result maps to a predicate
                 // Otherwise, it maps to a binary op.
             }
             _ => {
                 let msg = String::from("Unsupported global expression type: ")
-                    + format!("{:?}", expression_variant!(expr)).as_str();
+                    + format!("{:?}", expression_variant!(*expr)).as_str();
                 return Err(BoundsCheckError::Unsupported(msg));
             }
-        }
-        .into();
+        };
         self.global_exprs.insert(expr_handle, res.clone());
         Ok(res)
     }
@@ -1144,7 +1542,6 @@ impl BoundsChecker {
             let ty = self.make_type(ty)?;
             self.types.push(ty.into());
         }
-
         // Now, mark the global expressions
 
         self.constants = Vec::with_capacity(module.constants.len());
@@ -1169,8 +1566,15 @@ impl BoundsChecker {
         }
 
         for (var_handle, var) in module.global_variables.iter() {
-            let var = self.mark_var(var_handle, var, "glbl")?;
-            self.global_vars.push(var);
+            let new_var = self.mark_var(var_handle, var, "glbl")?;
+            self.global_vars.push(new_var.clone());
+            // Now, we need to mark the initializer of the global variable.
+            if let Some(init) = var.init {
+                let expr =
+                    self.global_expression_resolution(init, &ModuleWithInfo { module, info })?;
+                self.helper
+                    .add_constraint(new_var, abc_helper::ConstraintOp::Assign, expr)?;
+            }
         }
 
         for (fun_handle, fun) in module.functions.iter() {
@@ -1186,7 +1590,7 @@ impl BoundsChecker {
                 partial_summary.arguments.push(var);
             }
 
-            let mut finfo = FunctionWithInfo {
+            let finfo = FunctionWithInfo {
                 func: fun,
                 info: &info[fun_handle],
             };
@@ -1200,13 +1604,13 @@ impl BoundsChecker {
             // Now begin the common function handling logic
             self.check_function(
                 &ModuleWithInfo { module, info },
-                &mut finfo,
+                &finfo,
                 &mut partial_summary,
                 &func_name,
             )?;
             let summary_handle = self.helper.end_summary()?;
             self.functions
-                .push(partial_summary.to_function_summary(summary_handle));
+                .push(partial_summary.into_function_summary(summary_handle));
         }
 
         // Entry points contain function summaries.
@@ -1218,9 +1622,9 @@ impl BoundsChecker {
             let nargs = partial_summary.nargs;
             self.helper.begin_summary(func_name.clone(), nargs)?;
             let ep_info = info.get_entry_point(pos);
-            let mut finfo = FunctionWithInfo {
+            let finfo = FunctionWithInfo {
                 func: &ep.function,
-                info: &ep_info,
+                info: ep_info,
             };
             for (pos, arg) in ep.function.arguments.iter().enumerate() {
                 let var = self.make_arg(arg, &ep.function, pos)?;
@@ -1230,7 +1634,7 @@ impl BoundsChecker {
                     Some(Binding::BuiltIn(crate::BuiltIn::LocalInvocationId)) => {
                         // If this is a local invocation id, then we add the constraint on its range from the workgroup information
                         // that we already have.
-                        for (dim, high) in ep.workgroup_size.iter().enumerate() {
+                        for (high, dim) in ep.workgroup_size.iter().zip(0u32..=2u32) {
                             // make a term for the access to the 0th element of the expression.
                             let access_term =
                                 Term::new_index_access(var.clone(), Term::new_literal(dim));
@@ -1257,7 +1661,7 @@ impl BoundsChecker {
 
             self.check_function(
                 &ModuleWithInfo { module, info },
-                &mut finfo,
+                &finfo,
                 &mut partial_summary,
                 &func_name,
             )?;
@@ -1265,7 +1669,7 @@ impl BoundsChecker {
             let summary_handle = self.helper.end_summary()?;
             // End the summary
             self.entry_points
-                .push(partial_summary.to_function_summary(summary_handle));
+                .push(partial_summary.into_function_summary(summary_handle));
         }
 
         Ok(())
