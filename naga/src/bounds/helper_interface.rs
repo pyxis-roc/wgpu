@@ -1,7 +1,5 @@
 use abc_helper::{AbcScalar, BinaryOp, CmpOp};
 
-
-
 impl From<crate::VectorSize> for std::num::NonZeroU8 {
     fn from(size: crate::VectorSize) -> Self {
         match size {
@@ -25,7 +23,7 @@ impl From<crate::VectorSize> for std::num::NonZeroU32 {
 impl std::fmt::Display for crate::Literal {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         use crate::Literal;
-        match self {
+        match *self {
             Literal::F64(flt) | Literal::AbstractFloat(flt) => write!(f, "{}", flt),
             Literal::F32(flt) => write!(f, "{}", flt),
             Literal::Bool(b) => write!(f, "{}", b),
@@ -166,5 +164,26 @@ impl HasType for crate::FunctionArgument {
 impl HasType for crate::LocalVariable {
     fn to_type(&self) -> crate::Handle<crate::Type> {
         self.ty
+    }
+}
+
+impl From<crate::Literal> for abc_helper::Term {
+    fn from(value: crate::Literal) -> Self {
+        match value {
+            crate::Literal::F64(flt) => {
+                abc_helper::Term::Literal(abc_helper::Literal::AbstractFloat(flt))
+            }
+            crate::Literal::AbstractFloat(flt) => {
+                abc_helper::Term::Literal(abc_helper::Literal::AbstractFloat(flt))
+            }
+            crate::Literal::F32(flt) => Self::Literal(flt.into()),
+            crate::Literal::Bool(true) => Self::new_literal_true(),
+            crate::Literal::Bool(false) => Self::new_literal_false(),
+            crate::Literal::I64(i) => Self::Literal(i.into()),
+            crate::Literal::U64(u) => Self::Literal(u.into()),
+            crate::Literal::I32(i) => Self::Literal(i.into()),
+            crate::Literal::U32(u) => Self::Literal(u.into()),
+            crate::Literal::AbstractInt(i) => Self::Literal(abc_helper::Literal::AbstractInt(i)),
+        }
     }
 }
