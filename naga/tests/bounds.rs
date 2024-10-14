@@ -70,3 +70,13 @@ fn test_complex_structs2() {
 fn test_if_else() {
     do_shader_test(Some("abc"), "if_else", "wgsl");
 }
+
+#[test]
+fn test_simple_alias() {
+    do_shader_test(Some("abc"), "simple_alias", "wgsl");
+}
+
+#[test]
+fn test_simple_loop() {
+    do_shader_test(Some("abc"), "simple_loop", "wgsl");
+}
