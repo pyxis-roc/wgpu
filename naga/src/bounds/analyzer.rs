@@ -8,20 +8,34 @@
 
 // use super::BoundsInfo;
 
-#![allow(dead_code, unused_variables, unused_imports, clippy::match_wildcard_for_single_variants)]
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_imports,
+    clippy::match_wildcard_for_single_variants
+)]
 
-use std::{collections::HashMap, fmt::Debug, ops};
+// use super::visitor::*;
+use super::BoundsCheckError;
+
+use std::{
+    any,
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    ops,
+};
 
 use super::helper_interface::{self, HasName, HasType};
 
 use crate::{
-    arena::BadHandle,
+    non_max_u32::NonMaxU32,
     valid::{GlobalUse, ModuleInfo},
-    AddressSpace, ArraySize, FastHashMap, FunctionArgument, GlobalVariable, Module,
+    AddressSpace, ArraySize, FastHashMap, FastHashSet, FunctionArgument, GlobalVariable, Module,
+    Statement,
 };
 use abc_helper::{self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, Predicate, Term};
 use log::info as log_info;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Convenience struct used to pass around a module with its info together in one term.
 #[derive(Clone, Copy)]
@@ -215,7 +229,10 @@ struct PartialFunctionSummary {
 
 /// Partial function summary is a function summary without a handle. The handle is added at the end.
 impl PartialFunctionSummary {
-    fn into_function_summary(self, handle: ConstraintHandle<abc_helper::Summary>) -> FunctionSummary {
+    fn into_function_summary(
+        self,
+        handle: ConstraintHandle<abc_helper::Summary>,
+    ) -> FunctionSummary {
         FunctionSummary {
             expressions: self.expressions,
             arguments: self.arguments,
@@ -250,8 +267,6 @@ impl ops::Index<crate::Handle<crate::LocalVariable>> for PartialFunctionSummary 
 ///
 /// It can be indexed by an [`Expression`] handle to get the helper's last `Term` that corresponds to the expression.
 /// It can also be indexed by a [`LocalVariable`] handle to get the helper's last `Term` corresponding to the local variable.
-///
-/// The `handle` field
 pub struct FunctionSummary {
     pub expressions: FastHashMap<crate::Handle<crate::Expression>, Term>,
     /// An arena containing the Terms that correspond to the arguments in the function.
@@ -294,30 +309,18 @@ impl std::fmt::Display for ExpressionOrLiteral {
     }
 }
 
-/// Helper to allow for generic funhctions of HasName
-
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum BoundsCheckError {
-    #[error("Bounds check failed: {0}")]
-    BoundsCheckFailed(String),
-    #[error("Unsupported: {0}")]
-    Unsupported(String),
-    #[error("{0}")]
-    Unexpected(String),
-    #[error("Attempt to reference a type that has not been declared.")]
-    UndefinedType,
-    #[error("{0}")]
-    BadHandle(#[from] BadHandle),
-    #[error("{0}")]
-    ConstraintHelperError(#[from] abc_helper::ConstraintError),
-}
-
 enum ResolvedAccess {
     Struct(crate::Type),
     Array {
         inner: crate::TypeInner,
         dimension: usize,
     },
+}
+
+enum TermModifyStatus {
+    Modified,
+    Unmodified,
+    Forbidden,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +350,79 @@ impl BlockContext {
         BlockContext {
             local_variable_map,
             global_variable_map,
+        }
+    }
+}
+
+// We need a visitor that marks statements that need to be visited.
+// The way we are going to do this is as follows:
+
+struct StatementMarker {
+    // The current block we are in.
+    current_block: crate::Block,
+    // The current function we are in.
+    current_function: crate::Function,
+    // The current module we are in.
+    current_module: Module,
+    // The current module info we are in.
+    current_module_info: ModuleInfo,
+    // The current function info we are in.
+    current_function_info: crate::valid::FunctionInfo,
+    // The current function summary we are in.
+    current_function_summary: PartialFunctionSummary,
+    // The current block context we are in.
+    current_block_context: BlockContext,
+    // The current bounds checker we are in.
+    current_bounds_checker: BoundsChecker,
+
+    // Track the statements that need to be visited.
+    needs_visit: FastHashSet<crate::Handle<crate::Expression>>,
+    // Track the expressions that need to be visited.
+
+    // In step 1, we mark all expressions that appear in an acess or AccessIndex, a return,
+    // or a function call
+
+    // In step 2, we mark all expressions that appear in statements impacting control flow
+}
+
+#[derive(Default)]
+struct FunctionVisitTracker {
+    pub(crate) local_needs_visit: FastHashSet<crate::Handle<crate::LocalVariable>>,
+    pub(crate) expressions_needing_visit: FastHashSet<crate::Handle<crate::Expression>>,
+}
+
+struct ExpressionVisitor<'a> {
+    /// The module we are visiting.
+    module: &'a Module,
+    /// Globals that need to be visited.
+    global_needs_visit: FastHashSet<crate::Handle<GlobalVariable>>,
+    /// Functions
+    functions: FastHashMap<crate::Handle<crate::Function>, FunctionVisitTracker>,
+    /// Entry points
+    entry_points: FastHashMap<usize, FunctionVisitTracker>,
+}
+
+impl<'a> ExpressionVisitor<'a> {
+    /// Make a new Expression Visitor.
+    ///
+    /// This will add a default FunctionVisitTracker for all functions and entry points in the module.
+    fn new(module: &'a Module) -> Self {
+        let mut functions =
+            FastHashMap::with_capacity_and_hasher(module.functions.len(), Default::default());
+        for (handle, fun) in module.functions.iter() {
+            functions.insert(handle, FunctionVisitTracker::default());
+        }
+
+        let mut entry_points =
+            FastHashMap::with_capacity_and_hasher(module.entry_points.len(), Default::default());
+        for (index, ep) in module.entry_points.iter().enumerate() {
+            entry_points.insert(index, FunctionVisitTracker::default());
+        }
+        ExpressionVisitor {
+            module,
+            global_needs_visit: FastHashSet::default(),
+            functions,
+            entry_points,
         }
     }
 }
@@ -448,6 +524,278 @@ impl BoundsChecker {
             .map_err(BoundsCheckError::ConstraintHelperError)?;
 
         Ok(var)
+    }
+
+    /// Loop pattern 1 is where we have a loop that starts with 2 emits: the first is the emit of the local variable that
+    /// is the induction variable,
+    /// and the second is an expression consisting of the loop condition.
+    #[allow(clippy::too_many_arguments)] // Helper function used only for organizing logic.
+    fn model_std_for_loop(
+        &mut self,
+        module: &ModuleWithInfo,
+        func_ctx: &FunctionWithInfo,
+        func_summary: &mut PartialFunctionSummary,
+        block_ctx: &mut BlockContext,
+        body: &crate::Block,
+        continuing: &crate::Block,
+        break_if: &Option<crate::Handle<crate::Expression>>,
+    ) -> Result<(), BoundsCheckError> {
+        // Check that the first two expressions are emits.
+        let mut body_iter = body.iter();
+        let (load_handle, lvar_expr_handle, lvar_handle) = body_iter
+            .next()
+            .and_then(|stmt| {
+                if let Statement::Emit(ref r1) = *stmt {
+                    if r1.index_range().len() == 1 {
+                        let e1 = r1.clone().next()?;
+                        if let crate::Expression::Load { pointer } = func_ctx.func.expressions[e1] {
+                            // the expression representing the local variable...
+                            if let crate::Expression::LocalVariable(lvar) =
+                                func_ctx.func.expressions[pointer]
+                            {
+                                return Some((e1, pointer, lvar));
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .ok_or(BoundsCheckError::UnsupportedLoopStructure)?;
+
+        // Second emit must be loop condition
+        let loop_cond_handle = body_iter
+            .next()
+            .and_then(|stmt| {
+                if let &Statement::Emit(ref r2) = stmt {
+                    if r2.index_range().len() == 1 {
+                        let e2 = r2.clone().next()?;
+                        if let crate::Expression::Binary {
+                            op:
+                                crate::BinaryOperator::Equal
+                                | crate::BinaryOperator::NotEqual
+                                | crate::BinaryOperator::Less
+                                | crate::BinaryOperator::LessEqual
+                                | crate::BinaryOperator::Greater
+                                | crate::BinaryOperator::GreaterEqual,
+                            right,
+                            left,
+                        } = func_ctx.func.expressions[e2]
+                        {
+                            if right == load_handle || left == load_handle {
+                                return Some(e2);
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .ok_or(BoundsCheckError::UnsupportedLoopStructure)?;
+
+        // loop_cond_handle is the condition of the loop.
+        // Now we check that the next statement is an if statement, conditioned on the loop condition,
+        // whose reject is a break.
+        // This is the for loop pattern.
+        match body_iter.next() {
+            Some(&Statement::If {
+                condition,
+                ref accept,
+                ref reject,
+            }) if condition == loop_cond_handle
+                && accept.is_empty()
+                && reject.len() == 1
+                && matches!(reject[0], Statement::Break) =>
+            {
+                Ok(())
+            }
+            _ => Err(BoundsCheckError::UnsupportedLoopStructure),
+        }?;
+        // The rest of the body iter should probably be visited now.
+
+        // Now check if the `continuing` block is as we expect.
+
+        let mut continuing_iter = continuing.iter();
+        // In the continuing block, we expect a single emit with two expressions. The first must be a load to the induction variable.
+        let (store_handle_expr, update_handle_expr) = match continuing_iter
+            .next()
+            .ok_or(BoundsCheckError::UnsupportedLoopStructure)?
+        {
+            &Statement::Emit(ref r) => {
+                // r must be two expressions. The first is a load to the induction variable, the second is the expression that
+                // updates the induction variable.
+                if r.index_range().len() != 2 {
+                    return Err(BoundsCheckError::UnsupportedLoopStructure);
+                }
+                // the first expression must be a load to the induction variable.
+                match r.first_and_last() {
+                    Some((load_handle, update_handle)) if matches!(func_ctx.func.expressions[load_handle], crate::Expression::Load { pointer } if pointer == lvar_expr_handle) => {
+                        Ok((load_handle, update_handle))
+                    }
+                    _ => Err(BoundsCheckError::UnsupportedLoopStructure),
+                }
+            }
+            _ => Err(BoundsCheckError::UnsupportedLoopStructure),
+        }?;
+
+        // Expected structure: the next statement in `continuing` is a store where the pointer is the induction variable and the value is the
+        // second expression that was just emitted.
+        // same expression that was just emitted,
+        if !matches!(
+            continuing_iter.next(),
+            Some(&Statement::Store { pointer, value })
+            if pointer == lvar_expr_handle && value == update_handle_expr
+        ) {
+            return Err(BoundsCheckError::UnsupportedLoopStructure);
+        };
+
+        // At this point, the structure of the loop is as expected. Now, we just issue the proper stores that model it.
+
+        // Match on the condition portion of the loop.
+        //
+        let (cmp_op, cmp_left, cmp_right) = match func_ctx.func.expressions[loop_cond_handle] {
+            crate::Expression::Binary { op, left, right } => Ok((op, left, right)),
+            _ => Err(BoundsCheckError::UnsupportedLoopStructure),
+        }?;
+
+        let cmp_end = match (
+            &func_ctx.func.expressions[cmp_left],
+            &func_ctx.func.expressions[cmp_right],
+        ) {
+            (&crate::Expression::Load { ref pointer }, _) if *pointer == lvar_expr_handle => {
+                Ok(cmp_right)
+            }
+
+            (_, &crate::Expression::Load { ref pointer }) if *pointer == lvar_expr_handle => {
+                Ok(cmp_left)
+            }
+            _ => Err(BoundsCheckError::UnsupportedLoopStructure),
+        }?;
+
+        let cmp_op: abc_helper::CmpOp = cmp_op.try_into().map_err(|_| {
+            BoundsCheckError::Unsupported(format!(
+                "Unsupported comparison operator for loop condition {:?}",
+                cmp_op
+            ))
+        })?;
+
+        // Get the init as a Term.
+        let init_expr =
+            self.visit_expr(module, lvar_expr_handle, func_ctx, func_summary, block_ctx)?;
+
+        let end_expr = self.visit_expr(module, cmp_end, func_ctx, func_summary, block_ctx)?;
+
+        // Get the max as a term.
+
+        // This is the term for the init...
+        let init = block_ctx.local_variable_map[&lvar_handle].clone();
+
+        // We know start and end. Now we need to figure out how it is incremented, and make the term that it is incremented with.
+        use crate::BinaryOperator as BinOp;
+        if let crate::Expression::Binary { op, left, right } =
+            func_ctx.func.expressions[update_handle_expr]
+        {
+            // `other` is the side of the induction variable that is not the load to the induction variable.
+            let other = match (
+                &func_ctx.func.expressions[left],
+                &func_ctx.func.expressions[right],
+            ) {
+                (&crate::Expression::Load { pointer }, other) if pointer == lvar_expr_handle => {
+                    Ok(right)
+                }
+
+                (other, &crate::Expression::Load { pointer }) if pointer == lvar_expr_handle => {
+                    Ok(left)
+                }
+                _ => Err(BoundsCheckError::UnsupportedLoopStructure),
+            }?;
+
+            // We make a term for the expression that we are incremented by.
+            let inc_term = self.visit_expr(module, other, func_ctx, func_summary, block_ctx)?;
+
+            // And now, we make the increment term.
+
+            // We need a new term that is being used as the increment.
+            let next_term = self.mark_var(
+                lvar_handle,
+                &func_ctx.func.local_variables[lvar_handle],
+                "local",
+            )?;
+
+            // Now, get the binary op
+            let abc_op: abc_helper::BinaryOp = op.try_into().map_err(|_| {
+                BoundsCheckError::Unsupported(format!(
+                    "Unsupported binary operator for increment expression {:?}",
+                    op
+                ))
+            })?;
+            // Finally, we can begin the loop.
+            // Here, `next_term` is the name of the local variable for use within the loop.
+            // We need the old name of the term.
+            let old = block_ctx
+                .local_variable_map
+                .insert(lvar_handle, (next_term.clone(), true))
+                .ok_or(BoundsCheckError::Unexpected(
+                    "Undefined local variable".to_string(),
+                ))?
+                .0;
+            // // After we do this, any reference to the local variable should be replaced with the new term...
+            // println!("======");
+            // // print out the term we get when we search for local variable..
+            // println!("{:?}", block_ctx.local_variable_map[&lvar_handle]);
+            // println!("======");
+
+            // now we have to remove the old term from the expressions we have visited..
+            func_summary.expressions.remove(&lvar_expr_handle);
+            func_summary.expressions.remove(&load_handle);
+
+            // Okay, now we `begin_loop`.
+            // Here we assume an `increasing` loop that has been normalized.
+            // e.g., starts at N, increases by one.
+            self.helper
+                .mark_loop_variable(next_term, old, inc_term, abc_op)?;
+            let loop_cond_term =
+                self.visit_expr(module, loop_cond_handle, func_ctx, func_summary, block_ctx)?;
+
+            self.helper.begin_loop(loop_cond_term.clone())?;
+
+            // Now, iterate through the rest of body.
+            // First, though, get a snapshot of the block context.
+            let mut body_ctx = block_ctx.reset_writes();
+            // Now, we iterate through the rest of the statements in the body..
+            for stmt in body_iter {
+                self.visit_statement(stmt, module, func_ctx, func_summary, &mut body_ctx)?;
+            }
+
+            let &mut BlockContext {
+                ref mut local_variable_map,
+                ref mut global_variable_map,
+            } = block_ctx;
+
+            self.helper.end_loop()?;
+
+            // We need to update the variables that were modified in the loop here.
+            self.update_loop(
+                &mut body_ctx.local_variable_map,
+                &mut block_ctx.local_variable_map,
+                &loop_cond_term,
+                &func_ctx.func.local_variables,
+                "local",
+            )?;
+
+            self.update_loop(
+                &mut body_ctx.global_variable_map,
+                &mut block_ctx.global_variable_map,
+                &loop_cond_term,
+                &module.module.global_variables,
+                "global",
+            )?;
+
+            // Now, after the loop, I have to mark each variable that was updated..
+            // Now we have to unify the block context..
+            // Though if the loop variable was written to, then this is an unsupported loop
+            Ok(())
+        } else {
+            Err(BoundsCheckError::UnsupportedLoopStructure)
+        }
     }
 
     /// Make a name for the expression.
@@ -940,6 +1288,7 @@ impl BoundsChecker {
     ///
     /// [`visit_statement`]: Self::visit_statement
     #[allow(clippy::too_many_arguments)]
+    #[allow(unreachable_code)]
     fn visit_loop(
         &mut self,
         module: &ModuleWithInfo,
@@ -962,20 +1311,50 @@ impl BoundsChecker {
                 "Loop with an empty body".to_string(),
             ));
         }
+        return self.model_std_for_loop(
+            module,
+            func_ctx,
+            func_summary,
+            block_ctx,
+            body,
+            continuing,
+            break_if,
+        );
         // we want an iterator over body
+
         let mut body_iter = body.into_iter().peekable();
-        // Go through all of the emits.
+
+        // Go through the body, and track the writes of any variables...
+        // Now, go through the body again, and track if any written variables are used in the right hand side of the write.
+        // If they are, then these are induction variables that need to be marked as such.
+
+        // We have to go through the statement visitor and determine all variables that are written to.
+        // Then, we have to go through it again and determine all variables whose store expression references variables
+        // that are written to.
+        // for stmt in body_iter {
+        //     self.visit_statement(stmt, module, func_ctx, func_summary, &mut loop_ctx)?;
+        // }
+
+        // Reject any stores to variables that are that are not induction variables.
 
         while let Some(&&S::Emit(ref r)) = body_iter.peek() {
-            // iterate through the expressions in r
+            // iterate through the expressions.
             for e in r.clone() {
                 self.visit_expr(module, e, func_ctx, func_summary, block_ctx)?;
             }
             body_iter.next();
         }
+
+        // Find the initializer....
+
+        // Mark up any variable that is written to inside the loop
+
+        //
+
         // We expect to see an If (condition) { {}; break; } structure.
+        // We also expect, in the continuing block, to see an increment of the loop variable
         // This indicates that this is a traditional loop.
-        // Otherwise, this is the `do-while` loop form that, well, we just don't
+        // Now, we are going to reject ANY other break statement.
         match body_iter.next() {
             Some(&S::If {
                 ref condition,
@@ -1057,6 +1436,29 @@ impl BoundsChecker {
         Ok(())
     }
 
+    fn update_loop<T: HasName + HasType>(
+        &mut self,
+        modified_map: &mut FastHashMap<crate::Handle<T>, (Term, bool)>,
+        context_map: &mut FastHashMap<crate::Handle<T>, (Term, bool)>,
+        condition: &Term,
+        arena: &crate::arena::Arena<T>,
+        space: &str,
+    ) -> Result<(), BoundsCheckError> {
+        for (handle, &mut (ref mut old_term, ref mut old_update)) in context_map.iter_mut() {
+            let (term, modified) =
+                modified_map
+                    .remove(handle)
+                    .ok_or(BoundsCheckError::Unexpected(
+                        "Missing ".to_string() + space + " variable",
+                    ))?;
+            if !modified {
+                continue;
+            }
+            let new_var = self.mark_var(*handle, &arena[*handle], space)?;
+        }
+
+        Ok(())
+    }
     /// Does if-else updating of the context map, for either global variables or local variables.
     ///
     /// This iterates through each of the handles to variables in the context map, and replaces them with
@@ -1124,6 +1526,7 @@ impl BoundsChecker {
         }
         Ok(())
     }
+
     /// Visit an `If` statement. Used exclusively by [`visit_statement`], but extracted to its own
     /// method to improve readability.
     ///
@@ -1191,14 +1594,14 @@ impl BoundsChecker {
     }
     fn visit_statement(
         &mut self,
-        stmt: &crate::Statement,
+        stmt: &Statement,
         module: &ModuleWithInfo,
         func_ctx: &FunctionWithInfo,
         func_summary: &mut PartialFunctionSummary,
         block_ctx: &mut BlockContext,
     ) -> Result<bool, BoundsCheckError> {
         use crate::Expression as E;
-        use crate::Statement as S;
+        use Statement as S;
         match *stmt {
             S::Loop {
                 ref body,
@@ -1344,20 +1747,6 @@ impl BoundsChecker {
             ));
         }
 
-        // Go through local variables...
-        let mut local_variable_map: FastHashMap<crate::Handle<crate::LocalVariable>, (Term, bool)> =
-            FxHashMap::with_capacity_and_hasher(func.func.local_variables.len(), Default::default());
-        for (var_handle, var) in func.func.local_variables.iter() {
-            let var = self.mark_var(var_handle, var, name)?;
-            func_summary.local_variabes.push(var.clone());
-            local_variable_map.insert(var_handle, (var, false));
-        }
-
-        if let Some(crate::FunctionResult { ty, .. }) = func.func.result {
-            let ty = self[ty].clone();
-            self.helper.mark_return_type(ty)?;
-        }
-
         let mut global_variable_map: FastHashMap<crate::Handle<GlobalVariable>, (Term, bool)> =
             FxHashMap::with_capacity_and_hasher(
                 func_info.global_variable_count(),
@@ -1383,16 +1772,74 @@ impl BoundsChecker {
             global_variable_map.insert(handle, (self[handle].clone(), false));
         }
 
-        self.visit_block(
-            &func.func.body,
-            module,
-            func,
-            func_summary,
-            &mut BlockContext {
-                local_variable_map,
-                global_variable_map,
-            },
-        )?;
+        // Go through local variables...
+        // Make the block context
+        let mut block_ctx = BlockContext {
+            local_variable_map: FxHashMap::with_capacity_and_hasher(
+                func.func.local_variables.len(),
+                Default::default(),
+            ),
+            global_variable_map,
+        };
+        for (var_handle, var) in func.func.local_variables.iter() {
+            let var_term = self.mark_var(var_handle, var, name)?;
+            func_summary.local_variabes.push(var_term.clone());
+            // If there is an init method, then we need to visit it.
+            if let Some(init) = var.init {
+                let init_term = self.visit_expr(module, init, func, func_summary, &block_ctx)?;
+                self.helper.add_assumption(
+                    var_term.clone(),
+                    abc_helper::ConstraintOp::Assign,
+                    init_term,
+                )?;
+            } else {
+                // In this case, we do nothing, as the variable is not initialized.
+                // Though if this is wgsl frontend, variables that are not initialized are initialized to 0, right?
+                // match on the type of inner.
+                use crate::TypeInner as Ty;
+                match module.module.types[var.ty].inner {
+                    Ty::Scalar(s) => {
+                        use crate::Scalar;
+                        self.helper.add_assumption(
+                            var_term.clone(),
+                            abc_helper::ConstraintOp::Assign,
+                            match s {
+                                Scalar::BOOL => Term::new_literal_false(),
+                                Scalar::I32 => Term::new_literal(abc_helper::Literal::I32(0i32)),
+                                Scalar::F32 => Term::new_literal(abc_helper::Literal::F32(0.0f32)),
+                                Scalar::U32 => Term::new_literal(abc_helper::Literal::U32(0u32)),
+                                Scalar::I64 => Term::new_literal(abc_helper::Literal::I64(0i64)),
+                                Scalar::U64 => Term::new_literal(abc_helper::Literal::U64(0u64)),
+                                Scalar::F64 => Term::new_literal(abc_helper::Literal::F64(0.0f64)),
+                                _ => {
+                                    return Err(BoundsCheckError::Unsupported(format!(
+                                        "Unitialized local variable of type {:?}",
+                                        s
+                                    )));
+                                }
+                            },
+                        )?;
+                    }
+                    ref e => {
+                        return Err(BoundsCheckError::Unsupported(format!(
+                            "Unitialized local variable of type {:?}",
+                            e
+                        )));
+                    }
+                }
+            }
+
+            block_ctx
+                .local_variable_map
+                .insert(var_handle, (var_term, false));
+        }
+
+        if let Some(crate::FunctionResult { ty, .. }) = func.func.result {
+            let ty = self[ty].clone();
+            self.helper.mark_return_type(ty)?;
+        }
+
+        self.visit_block(&func.func.body, module, func, func_summary, &mut block_ctx)?;
 
         // Now, any global variables that have *write* usage will be marked as 'used' by this function.
         // That way, when we call a function, we can add the information as to which globals were written to there.
