@@ -1,6 +1,10 @@
 mod analyzer;
 mod helper_interface;
 
+mod utils;
+
+// mod visitor;
+
 pub use analyzer::BoundsChecker;
 
 /// Helper to allow for generic funhctions of HasName

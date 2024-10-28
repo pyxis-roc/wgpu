@@ -84,7 +84,13 @@ petgraph = { version = "0.6", optional = true }
 pp-rs = { version = "0.2.1", optional = true }
 hexf-parse = { version = "0.2.1", optional = true }
 unicode-xid = { version = "0.2.6", optional = true }
-abc-helper = { git = "ssh://git@github.com/pyxis-roc/wgpu-abc-helper.git", optional = true, branch="main" }
+
+[dependencies.abc-helper]
+git = "ssh://git@github.com/pyxis-roc/wgpu-abc-helper.git"
+optional = true
+branch = "main"
+features = ["serialize"]
+
 
 [build-dependencies]
 cfg_aliases.workspace = true

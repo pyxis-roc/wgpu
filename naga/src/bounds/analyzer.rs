@@ -18,6 +18,8 @@
 // use super::visitor::*;
 use super::BoundsCheckError;
 
+use super::utils::{expression_variant, statement_variant};
+
 use std::{
     any,
     collections::{HashMap, VecDeque},
@@ -33,7 +35,9 @@ use crate::{
     AddressSpace, ArraySize, FastHashMap, FastHashSet, FunctionArgument, GlobalVariable, Module,
     Statement,
 };
-use abc_helper::{self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, Predicate, Term};
+use abc_helper::{
+    self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, Predicate, StructField, Term,
+};
 use log::info as log_info;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -48,80 +52,6 @@ struct ModuleWithInfo<'a> {
 struct FunctionWithInfo<'a> {
     func: &'a crate::Function,
     info: &'a crate::valid::FunctionInfo,
-}
-
-/// Macro used only for debugging purposes that prints the variant of an expression.
-#[allow(unused_macros)]
-macro_rules! expression_variant {
-    ($expr:expr) => {
-        match $expr {
-            crate::Expression::Literal { .. } => "Literal",
-            crate::Expression::Constant { .. } => "Constant",
-            crate::Expression::Override { .. } => "Override",
-            crate::Expression::ZeroValue { .. } => "ZeroValue",
-            crate::Expression::Compose { .. } => "Compose",
-            crate::Expression::Access { .. } => "Access",
-            crate::Expression::AccessIndex { .. } => "AccessIndex",
-            crate::Expression::Splat { .. } => "Splat",
-            crate::Expression::Swizzle { .. } => "Swizzle",
-            crate::Expression::FunctionArgument(..) => "FunctionArgument",
-            crate::Expression::GlobalVariable(..) => "GlobalVariable",
-            crate::Expression::LocalVariable(..) => "LocalVariable",
-            crate::Expression::Load { .. } => "Load",
-            crate::Expression::ImageSample { .. } => "ImageSample",
-            crate::Expression::ImageLoad { .. } => "ImageLoad",
-            crate::Expression::ImageQuery { .. } => "ImageQuery",
-            crate::Expression::Unary { .. } => "Unary",
-            crate::Expression::Binary { .. } => "Binary",
-            crate::Expression::Select { .. } => "Select",
-            crate::Expression::Derivative { .. } => "Derivative",
-            crate::Expression::Relational { .. } => "Relational",
-            crate::Expression::Math { .. } => "Math",
-            crate::Expression::As { .. } => "As",
-            crate::Expression::CallResult { .. } => "CallResult",
-            crate::Expression::AtomicResult { .. } => "AtomicResult",
-            crate::Expression::WorkGroupUniformLoadResult { .. } => "WorkGroupUniformLoadResult",
-            crate::Expression::ArrayLength(..) => "ArrayLength",
-            crate::Expression::RayQueryProceedResult { .. } => "RayQueryProceedResult",
-            crate::Expression::RayQueryGetIntersection { .. } => "RayQueryGetIntersection",
-            crate::Expression::SubgroupBallotResult { .. } => "SubgroupBallotResult",
-            crate::Expression::SubgroupOperationResult { .. } => "SubgroupOperationResult",
-            // In case new expressions are added in the future...
-            #[allow(unreachable_patterns)]
-            _ => "UNKNOWN_EXPR_KIND",
-        }
-    };
-}
-
-/// Macro used only for debugging purposes that prints the variant of a statement.
-#[allow(unused_macros)]
-macro_rules! statement_variant {
-    ($expr:expr) => {
-        match $expr {
-            crate::Statement::Emit { .. } => "Emit",
-            crate::Statement::Block { .. } => "Block",
-            crate::Statement::If { .. } => "If",
-            crate::Statement::Switch { .. } => "Switch",
-            crate::Statement::Loop { .. } => "Loop",
-            crate::Statement::Break { .. } => "Break",
-            crate::Statement::Continue { .. } => "Continue",
-            crate::Statement::Return { .. } => "Return",
-            crate::Statement::Kill { .. } => "Kill",
-            crate::Statement::Barrier(..) => "Barrier",
-            crate::Statement::Store { .. } => "Store",
-            crate::Statement::ImageStore { .. } => "ImageStore",
-            crate::Statement::Atomic { .. } => "ImageStore",
-            crate::Statement::WorkGroupUniformLoad { .. } => "WorkGroupUniformLoad",
-            crate::Statement::Call { .. } => "Call",
-            crate::Statement::RayQuery { .. } => "RayQuery",
-            crate::Statement::SubgroupBallot { .. } => "SubgroupBallot",
-            crate::Statement::SubgroupGather { .. } => "SubgroupGather",
-            crate::Statement::SubgroupCollectiveOperation { .. } => "SubgroupCollectiveOperation",
-            // In case new expressions are added in the future...
-            #[allow(unreachable_patterns)]
-            _ => "UNKNOWN_STMT_KIND",
-        }
-    };
 }
 
 /// Type alias for the handle type used in the AbcHelper
@@ -465,8 +395,7 @@ impl BoundsChecker {
             }),
             Struct { ref members, .. } => {
                 // We make a struct type
-                let mut my_map =
-                    crate::FastHashMap::with_capacity_and_hasher(members.len(), Default::default());
+                let mut struct_fields = Vec::with_capacity(members.len());
 
                 for member in members {
                     if member.binding.is_some() {
@@ -477,9 +406,14 @@ impl BoundsChecker {
                     let name = member.name.clone().ok_or(BoundsCheckError::Unsupported(
                         "Unnamed struct member".to_string(),
                     ))?;
-                    my_map.insert(name, self.types[member.ty.index()].clone());
+                    struct_fields.push(StructField::new(
+                        name,
+                        self.types[member.ty.index()].clone(),
+                    ));
                 }
-                Ok(AbcType::Struct { members: my_map })
+                Ok(AbcType::Struct {
+                    members: struct_fields,
+                })
             }
             _ => Err(BoundsCheckError::Unsupported(format!(
                 "Unsupported type: {:?}",
@@ -520,7 +454,7 @@ impl BoundsChecker {
         // Mark the type of the variable
         let ty = self.types[term.to_type().index()].clone();
         self.helper
-            .mark_type(var.clone(), ty)
+            .mark_type(&var, &ty)
             .map_err(BoundsCheckError::ConstraintHelperError)?;
 
         Ok(var)
@@ -751,11 +685,11 @@ impl BoundsChecker {
             // Here we assume an `increasing` loop that has been normalized.
             // e.g., starts at N, increases by one.
             self.helper
-                .mark_loop_variable(next_term, old, inc_term, abc_op)?;
+                .mark_loop_variable(&next_term, &old, &inc_term, abc_op)?;
             let loop_cond_term =
                 self.visit_expr(module, loop_cond_handle, func_ctx, func_summary, block_ctx)?;
 
-            self.helper.begin_loop(loop_cond_term.clone())?;
+            self.helper.begin_loop(&loop_cond_term)?;
 
             // Now, iterate through the rest of body.
             // First, though, get a snapshot of the block context.
@@ -892,42 +826,37 @@ impl BoundsChecker {
                 let size_literal: Term = Term::new_literal(size);
                 // Note: We can optimize this later on by reusing the same literal for 0.
                 self.helper.add_tracked_constraint(
-                    index_literal.clone(),
+                    &index_literal,
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
-                    size_literal.clone(),
+                    &size_literal,
                     // The expression this comes from...
                     abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 self.helper.add_tracked_constraint(
-                    index_literal.clone(),
+                    &index_literal,
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
-                    Term::new_literal(0),
+                    &Term::new_literal(0),
                     abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 // Make a new expression that is an access to the base and the index.
-                Ok(Term::new_index_access(
-                    base_expr.clone(),
-                    index_literal.clone(),
-                ))
+                Ok(Term::new_index_access(&base_expr, &index_literal))
             }
             AbcType::DynamicArray { ref ty } => {
                 let index_literal: Term = as_expression!(index);
-                let res = Term::new_index_access(base_expr.clone(), index_literal.clone());
+                let res = Term::new_index_access(&base_expr, &index_literal);
                 self.helper.add_tracked_constraint(
-                    index_literal.clone(),
+                    &index_literal,
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
-                    Term::new_literal(0),
+                    &Term::new_literal(0),
                     abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 // We need an expression for the array length..
-                let len_expression = self
-                    .helper
-                    .add_expression(AbcExpression::ArrayLength(base_expr.clone()))?;
+                let len_expression = Term::make_array_length(&base_expr);
                 self.helper.add_tracked_constraint(
-                    index_literal.clone(),
+                    &index_literal,
                     abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
                     // todo: fix this.
-                    len_expression,
+                    &len_expression,
                     abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
                 )?;
                 Ok(res)
@@ -935,7 +864,7 @@ impl BoundsChecker {
             AbcType::Struct { ref members } => {
                 if let ExpressionOrLiteral::Literal(l) = index {
                     Ok(Term::new_struct_access(
-                        base_expr.clone(),
+                        &base_expr,
                         match naga_ty.inner {
                             crate::TypeInner::Struct { ref members, .. } => {
                                 let member = &members[l as usize];
@@ -1061,7 +990,7 @@ impl BoundsChecker {
                     (ScalarKind::Float, Some(b)) => {
                         Term::new_cast(a.clone(), abc_helper::AbcScalar::Float(b))
                     }
-                    (ScalarKind::Bool, _) => Term::new_unit_pred(a),
+                    (ScalarKind::Bool, _) => Term::new_unit_pred(&a),
                     _ => {
                         return Err(BoundsCheckError::Unsupported(format!(
                             "Cast of type {:?} of size {:?}",
@@ -1100,9 +1029,9 @@ impl BoundsChecker {
 
                 // Add the equality constraint.
                 self.helper.add_constraint(
-                    expr_var_name.clone(),
+                    &expr_var_name,
                     abc_helper::ConstraintOp::Assign,
-                    resolved,
+                    &resolved,
                 )?;
 
                 // TODO: Figure out if we need to mark the type of the expression?
@@ -1213,10 +1142,7 @@ impl BoundsChecker {
                         Some(&TypeInner::Struct { ref members, .. }) => {
                             value = Term::new_struct_store(
                                 func_summary[base].clone(),
-                                // unwrap is okay as we have already rejected struct members with no name.
-                                members[index as usize].name.clone().unwrap(),
-                                // unwrap unchecked is OK here since module_ty cannot be Some if ty_inner is None.
-                                self[unsafe { *ty_inner.unwrap_unchecked() }].clone(),
+                                index as usize,
                                 value.clone(),
                             )
                         }
@@ -1249,9 +1175,9 @@ impl BoundsChecker {
                     // Get a new term for the var.
                     let new_term = self.mark_var(l, &func_ctx.func.local_variables[l], "local")?;
                     self.helper.add_assumption(
-                        new_term.clone(),
+                        &new_term,
                         abc_helper::ConstraintOp::Assign,
-                        value.clone(),
+                        &value,
                     )?;
                     block_ctx.local_variable_map.insert(l, (new_term, true));
                     break Ok(());
@@ -1261,9 +1187,9 @@ impl BoundsChecker {
                     let new_term =
                         self.mark_var(g, &module.module.global_variables[g], "global")?;
                     self.helper.add_assumption(
-                        new_term.clone(),
+                        &new_term,
                         abc_helper::ConstraintOp::Assign,
-                        value.clone(),
+                        &value,
                     )?;
                     block_ctx.global_variable_map.insert(g, (new_term, true));
                     break Ok(());
@@ -1364,7 +1290,7 @@ impl BoundsChecker {
                 // Reject must be of len 1 with a single statement that is a break.
                 let condition =
                     self.visit_expr(module, *condition, func_ctx, func_summary, block_ctx)?;
-                self.helper.begin_loop(condition)?;
+                self.helper.begin_loop(&condition)?;
             }
             Some(s) => {
                 return Err(BoundsCheckError::Unsupported(format!(
@@ -1427,10 +1353,10 @@ impl BoundsChecker {
                 .declare_var(abc_helper::Var { name: result_name })?;
             func_summary
                 .expressions
-                .insert(result, self.helper.make_call(handle, args, Some(var))?);
+                .insert(result, self.helper.make_call(&handle, args, Some(&var))?);
         } else {
             // If there is no result, we just make the call.
-            self.helper.make_call(handle, args, None)?;
+            self.helper.make_call(&handle, args, None)?;
         };
 
         Ok(())
@@ -1509,20 +1435,17 @@ impl BoundsChecker {
             *old_term = new_var.clone();
             *old_update = true;
             let new_term = match (accept_modified, reject_modified) {
-                (true, true) => Term::new_select(condition.clone(), accept_term, reject_term),
-                (true, false) => Term::new_select(condition.clone(), accept_term, old_term.clone()),
-                (false, true) => Term::new_select(condition.clone(), old_term.clone(), reject_term),
+                (true, true) => Term::new_select(&condition, &accept_term, &reject_term),
+                (true, false) => Term::new_select(&condition, &accept_term, &old_term),
+                (false, true) => Term::new_select(&condition, old_term, &reject_term),
                 _ => {
                     // This should be unreachable.
                     unreachable!();
                 }
             };
             // Add the assumption that the new term is equal to the value of the variable.
-            self.helper.add_assumption(
-                new_var.clone(),
-                abc_helper::ConstraintOp::Assign,
-                new_term.clone(),
-            )?;
+            self.helper
+                .add_assumption(&new_var, abc_helper::ConstraintOp::Assign, &new_term)?;
         }
         Ok(())
     }
@@ -1548,14 +1471,14 @@ impl BoundsChecker {
         let reject_ctx = &mut accept_ctx.clone();
 
         if !accept.is_empty() {
-            self.helper.begin_predicate_block(condition.clone())?;
+            self.helper.begin_predicate_block(&condition)?;
             // Now, before we visit the b
             self.visit_block(accept, module, func_ctx, func_summary, accept_ctx)?;
             self.helper.end_predicate_block()?;
         }
         if !reject.is_empty() {
             self.helper
-                .begin_predicate_block(Term::new_not(condition.clone()))?;
+                .begin_predicate_block(&Term::new_not(&condition))?;
             self.visit_block(reject, module, func_ctx, func_summary, reject_ctx)?;
             self.helper.end_predicate_block()?;
         }
@@ -1788,9 +1711,9 @@ impl BoundsChecker {
             if let Some(init) = var.init {
                 let init_term = self.visit_expr(module, init, func, func_summary, &block_ctx)?;
                 self.helper.add_assumption(
-                    var_term.clone(),
+                    &var_term,
                     abc_helper::ConstraintOp::Assign,
-                    init_term,
+                    &init_term,
                 )?;
             } else {
                 // In this case, we do nothing, as the variable is not initialized.
@@ -1801,9 +1724,9 @@ impl BoundsChecker {
                     Ty::Scalar(s) => {
                         use crate::Scalar;
                         self.helper.add_assumption(
-                            var_term.clone(),
+                            &var_term,
                             abc_helper::ConstraintOp::Assign,
-                            match s {
+                            &match s {
                                 Scalar::BOOL => Term::new_literal_false(),
                                 Scalar::I32 => Term::new_literal(abc_helper::Literal::I32(0i32)),
                                 Scalar::F32 => Term::new_literal(abc_helper::Literal::F32(0.0f32)),
@@ -1819,6 +1742,10 @@ impl BoundsChecker {
                                 }
                             },
                         )?;
+                    }
+                    Ty::Array { base, size, stride } => {
+                        // Note: Uninitialized arrays are really initialized to 0.
+                        // However, for now, we leave them as undefined.
                     }
                     ref e => {
                         return Err(BoundsCheckError::Unsupported(format!(
@@ -1836,7 +1763,7 @@ impl BoundsChecker {
 
         if let Some(crate::FunctionResult { ty, .. }) = func.func.result {
             let ty = self[ty].clone();
-            self.helper.mark_return_type(ty)?;
+            self.helper.mark_return_type(&ty)?;
         }
 
         self.visit_block(&func.func.body, module, func, func_summary, &mut block_ctx)?;
@@ -1851,16 +1778,7 @@ impl BoundsChecker {
         Ok(())
     }
 
-    // pub fn mark_type(&mut self, ty: &crate::Type) {
-    //     // We need to have a name for the types that we see.
-    //     let ty_name = ty.name.clone().unwrap_or(String::from("$anon_type_"));
-    //     let ty = abc_helper::Type { name: ty_name };
-    //     self.helper.add_type(ty);
-    // }
-
-    // We need a handle of types to their names...
-
-    // Converts a binary operator to an ABC expression
+    /// Convert a binary operator to an ABC expression
     fn binary_to_abc_expression(
         op: crate::BinaryOperator,
         lhs: Term,
@@ -1871,13 +1789,13 @@ impl BoundsChecker {
         use abc_helper::CmpOp;
         use abc_helper::Predicate;
         if let Ok(binop) = op.try_into() {
-            Ok(Term::new_binary_op(binop, lhs, rhs))
+            Ok(Term::new_binary_op(binop, &lhs, &rhs))
         } else if let Ok(cmpop) = op.try_into() {
-            Ok(Term::new_comparison(cmpop, lhs, rhs))
+            Ok(Term::new_comparison(cmpop, &lhs, &rhs))
         } else {
             match op {
-                BinaryOperator::LogicalAnd => Ok(Term::new_logical_and(lhs, rhs)),
-                BinaryOperator::LogicalOr => Ok(Term::new_logical_or(lhs, rhs)),
+                BinaryOperator::LogicalAnd => Ok(Term::new_logical_and(&lhs, &rhs)),
+                BinaryOperator::LogicalOr => Ok(Term::new_logical_or(&lhs, &rhs)),
                 _ => Err(BoundsCheckError::Unsupported(
                     "Unsupported binary operator".to_string(),
                 )),
@@ -1932,7 +1850,6 @@ impl BoundsChecker {
         Ok(res)
     }
 
-    #[inline]
     fn make_function_summary(
         &self,
         fun: &crate::Function,
@@ -1967,7 +1884,7 @@ impl BoundsChecker {
         // Get the variable handle..
         let var = self
             .helper
-            .add_argument(name, self.types[arg.to_type().index()].clone())?;
+            .add_argument(name, &self.types[arg.to_type().index()].clone())?;
         Ok(var)
     }
 
@@ -2004,7 +1921,7 @@ impl BoundsChecker {
 
             // Mark the constraint of the initialization.
             self.helper
-                .add_constraint(cnst, abc_helper::ConstraintOp::Assign, expr)?;
+                .add_constraint(&cnst, abc_helper::ConstraintOp::Assign, &expr)?;
         }
         self.overrides = Vec::with_capacity(module.overrides.len());
         for (var_handle, var) in module.overrides.iter() {
@@ -2020,7 +1937,7 @@ impl BoundsChecker {
                 let expr =
                     self.global_expression_resolution(init, &ModuleWithInfo { module, info })?;
                 self.helper
-                    .add_constraint(new_var, abc_helper::ConstraintOp::Assign, expr)?;
+                    .add_constraint(&new_var, abc_helper::ConstraintOp::Assign, &expr)?;
             }
         }
 
@@ -2083,9 +2000,8 @@ impl BoundsChecker {
                         // that we already have.
                         for (high, dim) in ep.workgroup_size.iter().zip(0u32..=2u32) {
                             // make a term for the access to the 0th element of the expression.
-                            let access_term =
-                                Term::new_index_access(var.clone(), Term::new_literal(dim));
-                            self.helper.mark_range(access_term, 0u32, *high - 1)?;
+                            let access_term = Term::new_index_access(&var, &Term::new_literal(dim));
+                            self.helper.mark_range(&access_term, 0u32, *high - 1)?;
                             // We need to mark the range of the variable.
                         }
                     }

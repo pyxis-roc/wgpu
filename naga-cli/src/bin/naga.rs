@@ -79,6 +79,10 @@ struct Args {
     #[argh(switch)]
     dot_cfg_only: bool,
 
+    /// in abc constraint output, write as json instead of text.
+    #[argh(switch)]
+    abc_json: bool,
+
     /// specify file path to process STDIN as
     #[argh(option)]
     stdin_file_path: Option<String>,
@@ -319,6 +323,7 @@ struct Parameters<'a> {
     input_kind: Option<InputKind>,
     shader_stage: Option<ShaderStage>,
     defines: FastHashMap<String, String>,
+    abc_json: bool,
 }
 
 trait PrettyResult {
@@ -437,6 +442,7 @@ fn run() -> anyhow::Result<()> {
     params.keep_coordinate_space = args.keep_coordinate_space;
 
     params.dot.cfg_only = args.dot_cfg_only;
+    params.abc_json = args.abc_json;
 
     params.spv_out.bounds_check_policies = params.bounds_check_policies;
     params.spv_out.flags.set(
@@ -838,8 +844,14 @@ fn write_output(
                 if let Err(e) = b.abc_impl(module, info) {
                     eprintln!("Bounds checking failed: {e}. Not writing to file.");
                 } else {
+                    // Serialize the file to json.
                     let mut file = fs::File::create(output_path)?;
-                    b.helper.write_to_stream(&mut file)?;
+                    // Check if this is json
+                    if params.abc_json {
+                        serde_json::to_writer_pretty(file, b.helper.get_module())?;
+                    } else {
+                        b.helper.write_to_stream(&mut file)?;
+                    }
                 }
             } else {
                 eprintln!("Validation failed, skipping bounds checking");
