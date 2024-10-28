@@ -24,6 +24,7 @@ env_logger.workspace = true
 argh.workspace = true
 anyhow.workspace = true
 log.workspace = true
+serde_json.workspace = true
 
 [dependencies.naga]
 version = "23.0.0"
