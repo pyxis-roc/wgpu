@@ -453,14 +453,16 @@ fn run() -> anyhow::Result<()> {
     if args.bulk_validate {
         return bulk_validate(args, &params);
     }
+    let mut first_file = 1;
 
-    let (input_path, input) = if let Some(path) = args.files.first() {
-        let path = Path::new(path);
-        (path, fs::read(path)?)
-    } else if let Some(path) = &args.stdin_file_path {
+    let (input_path, input) = if let Some(path) = &args.stdin_file_path {
+        first_file = 0;
         let mut input = vec![];
         std::io::stdin().lock().read_to_end(&mut input)?;
         (Path::new(path), input)
+    } else if let Some(path) = args.files.first() {
+        let path = Path::new(path);
+        (path, fs::read(path)?)
     } else {
         return Err(CliError("Input file path is not specified").into());
     };
@@ -495,7 +497,7 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
-    let output_paths = args.files.get(1..).unwrap_or(&[]);
+    let output_paths = args.files.get(first_file..).unwrap_or(&[]);
 
     // Decide which capabilities our output formats can support.
     let validation_caps =
