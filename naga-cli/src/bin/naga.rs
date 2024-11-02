@@ -456,6 +456,7 @@ fn run() -> anyhow::Result<()> {
     if args.bulk_validate {
         return bulk_validate(args, &params);
     }
+    let mut first_file = 1;
 
     let mut files = args.files.iter();
 

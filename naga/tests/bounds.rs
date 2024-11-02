@@ -20,7 +20,10 @@ fn do_shader_test(subdir: Option<&str>, path: &str, extension: &str) {
         println!("Error: {:?}", e);
     }
 
-    bounds_checker.helper.write_to_stream(&mut std::io::stdout()).unwrap();
+    bounds_checker
+        .helper
+        .write_to_stream(&mut std::io::stdout())
+        .unwrap();
     assert!(res.is_ok());
 }
 
@@ -49,7 +52,6 @@ fn test_concatenate10() {
 fn test_shader_17() {
     do_shader_test(Some("abc"), "shader_17", "wgsl");
 }
-
 
 #[test]
 fn test_global_var_initializer() {

@@ -1013,6 +1013,171 @@ impl BoundsChecker {
                     "Attempted to visit a call result.".to_string(),
                 ))
             }
+            Expr::Relational { fun, argument } => {
+                use crate::RelationalFunction as R;
+                let arg =
+                    self.visit_expr(module_info, argument, func_ctx, func_summary, block_context)?;
+                // This is a vector of booleans, and we need to know of how many terms so that we can expand it.
+                // So, get the type of the argument
+
+                // If this is an `All` then we join with Predicate::And
+                // If this is an `Any` then we join with Predicate::Or
+                let compose_fn = match fun {
+                    R::All => Term::new_logical_and,
+                    R::Any => Term::new_logical_or,
+                    _ => {
+                        return Err(BoundsCheckError::Unsupported(format!(
+                            "Relational function: {:?}",
+                            fun
+                        )))
+                    }
+                };
+                // Now, figure out how many terms so we know how many to loop over.
+                let num_elems = self
+                    .get_num_elems(module_info.module, &module_info.info[argument])
+                    .ok_or(BoundsCheckError::Unexpected(
+                        "Could not get number of elements for relational argument".to_string(),
+                    ))?;
+                // Create a new term that composes the compose function over the kind of term.
+                // e.g., if this is an `All`, then this will expand to ((argument[0] && argument[1]) && ... && argument[n])
+                // Unsafe is OK here since we know that the number of elements is at least 1.
+                unsafe {
+                    (0..num_elems)
+                        .map(|i| {
+                            Term::new_index_access(
+                                &arg,
+                                &Term::new_literal(abc_helper::Literal::from(i)),
+                            )
+                        })
+                        .by_ref()
+                        .reduce(|a, b| compose_fn(&a, &b))
+                        .unwrap_unchecked()
+                }
+            }
+            Expr::Math {
+                fun,
+                arg,
+                arg1,
+                arg2,
+                arg3,
+            } => {
+                use crate::MathFunction as M;
+                match fun {
+                    M::Abs => {
+                        let arg = self.visit_expr(
+                            module_info,
+                            arg,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        Term::new_abs(&arg)
+                    }
+                    M::Min => {
+                        let arg = self.visit_expr(
+                            module_info,
+                            arg,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        let arg1 = self.visit_expr(
+                            module_info,
+                            arg1.map_or_else(
+                                || {
+                                    Err(BoundsCheckError::Unexpected(
+                                        "Wrong number of arguments to Min".to_string(),
+                                    ))
+                                },
+                                Ok,
+                            )?,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        Term::new_min(&arg, &arg1)
+                    }
+                    M::Max => {
+                        let arg = self.visit_expr(
+                            module_info,
+                            arg,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        let arg1 = self.visit_expr(
+                            module_info,
+                            arg1.map_or_else(
+                                || {
+                                    Err(BoundsCheckError::Unexpected(
+                                        "Wrong number of arguments to Max".to_string(),
+                                    ))
+                                },
+                                Ok,
+                            )?,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        Term::new_max(&arg, &arg1)
+                    }
+                    M::Pow => {
+                        let arg = self.visit_expr(
+                            module_info,
+                            arg,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        let arg1 = self.visit_expr(
+                            module_info,
+                            arg1.map_or_else(
+                                || {
+                                    Err(BoundsCheckError::Unexpected(
+                                        "Wrong number of arguments to Pow".to_string(),
+                                    ))
+                                },
+                                Ok,
+                            )?,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        Term::new_pow(&arg, &arg1)
+                    }
+                    M::Dot => {
+                        // Dot product is straightforward.
+                        let arg = self.visit_expr(
+                            module_info,
+                            arg,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        let arg2 = self.visit_expr(
+                            module_info,
+                            arg1.map_or_else(
+                                || {
+                                    Err(BoundsCheckError::Unexpected(
+                                        "Wrong number of arguments to Dot".to_string(),
+                                    ))
+                                },
+                                Ok,
+                            )?,
+                            func_ctx,
+                            func_summary,
+                            block_context,
+                        )?;
+                        Term::new_dot(&arg, &arg2)
+                    }
+                    _ => {
+                        return Err(BoundsCheckError::Unsupported(format!(
+                            "Unsupported math function: {:?}",
+                            fun
+                        )));
+                    }
+                }
+            }
             _ => {
                 return Err(BoundsCheckError::Unsupported(
                     "Unsupported expression type: ".to_owned() + expression_variant!(*expr),
@@ -1435,9 +1600,9 @@ impl BoundsChecker {
             *old_term = new_var.clone();
             *old_update = true;
             let new_term = match (accept_modified, reject_modified) {
-                (true, true) => Term::new_select(&condition, &accept_term, &reject_term),
-                (true, false) => Term::new_select(&condition, &accept_term, &old_term),
-                (false, true) => Term::new_select(&condition, old_term, &reject_term),
+                (true, true) => Term::new_select(condition, &accept_term, &reject_term),
+                (true, false) => Term::new_select(condition, &accept_term, old_term),
+                (false, true) => Term::new_select(condition, old_term, &reject_term),
                 _ => {
                     // This should be unreachable.
                     unreachable!();
@@ -1602,6 +1767,9 @@ impl BoundsChecker {
                 self.visit_store(module, func_ctx, func_summary, block_ctx, &pointer, &value)?;
             }
             S::Block(ref b) => self.visit_block(b, module, func_ctx, func_summary, block_ctx)?,
+            S::Barrier(_) => {
+                // We do nothing for barriers.
+            }
             _ => {
                 return Err(BoundsCheckError::Unsupported(
                     "Unsupported statement type: ".to_owned() + statement_variant!(*stmt),
@@ -1743,7 +1911,7 @@ impl BoundsChecker {
                             },
                         )?;
                     }
-                    Ty::Array { base, size, stride } => {
+                    Ty::Array { .. } | Ty::Vector { .. } => {
                         // Note: Uninitialized arrays are really initialized to 0.
                         // However, for now, we leave them as undefined.
                     }
@@ -1800,6 +1968,36 @@ impl BoundsChecker {
                     "Unsupported binary operator".to_string(),
                 )),
             }
+        }
+    }
+
+    /// Determine the number of elements of the vector type.
+    ///
+    /// This works on the TypeResolution to figure out how many elements.
+    ///
+    /// If this is not a vector, then we return `None`
+    fn get_num_elems(&self, module: &Module, ty: &crate::proc::TypeResolution) -> Option<u32> {
+        // Determine the number of elements of the type, assuming the type is a vector.
+        use crate::proc::TypeResolution as Tr;
+        use crate::TypeInner as Ty;
+        let ty_inner = match *ty {
+            Tr::Handle(h) => &module.types[h].inner,
+            Tr::Value(ref t) => t,
+        };
+        match *ty_inner {
+            Ty::Vector {
+                size: crate::VectorSize::Bi,
+                ..
+            } => Some(2u32),
+            Ty::Vector {
+                size: crate::VectorSize::Tri,
+                ..
+            } => Some(3u32),
+            Ty::Vector {
+                size: crate::VectorSize::Quad,
+                ..
+            } => Some(4u32),
+            _ => None,
         }
     }
 
