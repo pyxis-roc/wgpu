@@ -48,6 +48,7 @@ impl<'a> VarVisitor<'a> {
         );
 
         // Now, we go backwards through the expressions in the arena and visit them.
+        // Going backwards here lets us call fewer visits, as our visitor will visit expressions
         for (handle, _) in arena.iter().rev() {
             visitor.visit(handle, arena)?;
         }
@@ -268,6 +269,10 @@ impl ExpressionVisitor<VisitorError> for VarVisitor<'_> {
 
         if (self.is_indexable)(base) {
             self.exprs_with_accesses.extend(self.expr_stack.iter());
+            self.exprs_with_accesses.insert(
+                self.active_expr
+                    .expect("There should always be an active expression in visitor methods"),
+            );
             self.index_access_dependencies.extend(
                 self.subexpr_map
                     .get(&index)
@@ -293,8 +298,108 @@ impl ExpressionVisitor<VisitorError> for VarVisitor<'_> {
 
         if (self.is_indexable)(base) {
             self.exprs_with_accesses.extend(self.expr_stack.iter());
+            self.exprs_with_accesses.insert(
+                self.active_expr
+                    .expect("There should always be an active expression in visitor methods"),
+            );
         }
         Ok(())
     }
 }
 // If we saw a break, then we stop iterating future items in the block.
+
+
+
+#[cfg(all(test, feature = "wgsl-in"))]
+mod tests {
+    use super::*;
+    use crate::front::wgsl::parse_str;
+    use crate::span::SpanProvider;
+    use crate::valid::{Capabilities, ValidationFlags, Validator};
+
+    impl Handle<Expression> {
+        fn print_expr<'a>(self, arena: &Arena<Expression>, input: &'a str) -> &'a str {
+            // print the expression from the arena
+            // get the item in the arena.
+            let expr = arena.get_span(self);
+
+            input.get(expr.to_range().unwrap()).unwrap()
+        }
+    }
+    macro_rules! test_harness {
+        ($wgsl:expr, $module:ident,$validated:ident) => {
+            let $module = parse_str($wgsl).unwrap();
+            let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+            let $validated = validator.validate(&$module).unwrap();
+        };
+    }
+    // Test that expressions are properly added.
+    #[test]
+    fn test_simple() {
+        test_harness!(
+            r#"
+            fn main() {
+                let b = vec2u(1u, 1u);
+                let a = b[0];
+            }
+            "#,
+            module,
+            validated
+        );
+        // get function 0
+        let (fun_handle, fun) = module.functions.iter().next().unwrap();
+
+        let mut result = VarVisitor::visit_arena(
+            &fun.expressions,
+            &fun.local_variables,
+            &module.global_variables,
+            &module.global_expressions,
+            Box::new(|_| true),
+        )
+        .expect("Visitor should not fail.");
+
+        // We need to get the handle for the expression named `a`.
+        let a_expr_handle = fun
+            .expressions
+            .iter()
+            .find(|(expr_handle, _)| {
+                fun.named_expressions
+                    .get(expr_handle)
+                    .is_some_and(|name| name == "a")
+            })
+            .expect("Expression `a` should exist in the function.")
+            .0;
+        assert!(result.exprs_with_accesses.contains(&a_expr_handle));
+        // We need to check that we have
+    }
+
+    #[test]
+    fn test_complex() {
+        let input = r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+            @group(0) @binding(1) var<storage> control: u32;
+            @group(0) @binding(1) var<storage, read_write> idx: u32;
+            fn foo(i: u32) {
+                if (control < 10u) {
+                    a[idx] = control;
+                }
+            }"#;
+        test_harness!(input, module, validated);
+
+        let (fun_handle, fun) = module.functions.iter().next().unwrap();
+
+        let mut result = VarVisitor::visit_arena(
+            &fun.expressions,
+            &fun.local_variables,
+            &module.global_variables,
+            &module.global_expressions,
+            Box::new(|_| true),
+        )
+        .expect("Visitor should not fail.");
+
+        result.exprs_with_accesses.iter().for_each(|f| {
+            println!("{}", f.print_expr(&fun.expressions, input));
+        });
+
+        assert!(true)
+    }
+}

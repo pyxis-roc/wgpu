@@ -1,5 +1,5 @@
 use naga::valid::{Capabilities, ValidationFlags};
-
+use naga::bounds::AddressSpacesToCheck;
 use crate::snapshots::Input;
 
 fn do_shader_test(subdir: Option<&str>, path: &str, extension: &str) {
@@ -12,7 +12,9 @@ fn do_shader_test(subdir: Option<&str>, path: &str, extension: &str) {
 
     let module_info = validator.validate(&module).unwrap();
 
-    let mut bounds_checker = naga::bounds::BoundsChecker::new();
+    let config = AddressSpacesToCheck::all();
+    let mut bounds_checker = naga::bounds::BoundsChecker::new(config);
+
 
     let res = bounds_checker.abc_impl(&module, &module_info);
 
@@ -24,7 +26,8 @@ fn do_shader_test(subdir: Option<&str>, path: &str, extension: &str) {
         .helper
         .write_to_stream(&mut std::io::stdout())
         .unwrap();
-    assert!(res.is_ok());
+    res.expect("Bounds check failed");
+    assert!(true);
 }
 
 ///
@@ -81,4 +84,9 @@ fn test_simple_alias() {
 #[test]
 fn test_simple_loop() {
     do_shader_test(Some("abc"), "simple_loop", "wgsl");
+}
+
+#[test]
+fn test_unsupported_ignored() {
+    do_shader_test(Some("abc"), "unsupported_ignored", "wgsl");
 }

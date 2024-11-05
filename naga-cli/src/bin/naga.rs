@@ -456,7 +456,6 @@ fn run() -> anyhow::Result<()> {
     if args.bulk_validate {
         return bulk_validate(args, &params);
     }
-    let mut first_file = 1;
 
     let mut files = args.files.iter();
 
@@ -848,7 +847,8 @@ fn write_output(
         "abc" => {
             use naga::bounds::BoundsChecker;
             if let Some(info) = info {
-                let mut b = BoundsChecker::new();
+                let mut b = BoundsChecker::new(Default::default());
+                // TODO: add a way to configure the address spaces to check
                 if let Err(e) = b.abc_impl(module, info) {
                     eprintln!("Bounds checking failed: {e}. Not writing to file.");
                 } else {

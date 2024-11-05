@@ -19,7 +19,7 @@ bitflags::bitflags! {
     ///
     /// [`BoundsCheckPolicy`]: crate::proc::BoundsCheckPolicy
     #[derive(Clone, Copy)]
-    struct AddressSpacesToCheck: u8 {
+    pub struct AddressSpacesToCheck: u8 {
         const Function = 1;
         const Private = 1 << 1;
         const WorkGroup = 1 << 2;
@@ -36,7 +36,7 @@ impl Default for AddressSpacesToCheck {
 
 impl AddressSpacesToCheck {
     /// Given an address space, return whether the corresponding flag is set in `self`.
-    const fn contains_address_space(&self, space: crate::AddressSpace) -> bool {
+    pub const fn contains_address_space(&self, space: crate::AddressSpace) -> bool {
         match space {
             crate::AddressSpace::Function => self.contains(AddressSpacesToCheck::Function),
             crate::AddressSpace::Private => self.contains(AddressSpacesToCheck::Private),
@@ -70,4 +70,7 @@ pub enum BoundsCheckError {
     UnsupportedLoopStructure,
     #[error("Expecting a vector")]
     ExpectingVector,
+
+    #[error("VisitorError({0})")]
+    VisitorError(#[from] visitor::VisitorError),
 }

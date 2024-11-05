@@ -9,10 +9,10 @@ use crate::{
 };
 
 mod expression_visitor;
-use expression_visitor::ExpressionVisitor;
+pub use expression_visitor::ExpressionVisitor;
 
 mod statement_visitor;
-use statement_visitor::StatementVisitor;
+pub use statement_visitor::StatementVisitor;
 
 mod var_visitor;
 use super::AddressSpacesToCheck;
@@ -78,8 +78,8 @@ enum VarKind {
 }
 
 /// A MarkedExprKey is the key for marked expressions.
-#[derive(Clone, Copy, Hash, Eq, PartialEq)]
-enum MarkedExprKey {
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum MarkedExprKey {
     GlobalVariable(Handle<GlobalVariable>),
     /// A local variable belonging to an expression in the module's function corresponding to the handle.
     FunctionLocal(Handle<crate::Function>, Handle<LocalVariable>),
@@ -101,7 +101,7 @@ enum MarkedExprKey {
     Function(Handle<crate::Function>),
 }
 
-trait IntoMarkedKey {
+pub(crate) trait IntoMarkedKey {
     #[allow(clippy::wrong_self_convention)]
     fn as_marked_key_with(self, path: &StatementPathPart) -> MarkedExprKey;
 }
@@ -148,7 +148,7 @@ as_marked_key_impl!(MarkedExprKey::Function, Handle<crate::Function>);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct ControlFlags: u8 {
+    pub struct ControlFlags: u8 {
         const BREAK =  0x1;
         const CONTINUE = 0x2;
         const RETURN =  0x4;
@@ -161,8 +161,8 @@ impl Default for ControlFlags {
     }
 }
 
-#[derive(Default)]
-struct FunctionProperties {
+#[derive(Default, Debug, Clone)]
+pub(super) struct FunctionProperties {
     // Global variables written in the function (this can also be computed from the module info.)
     glbl_writes: FastHashSet<Handle<GlobalVariable>>,
     /// Function arguments that are written to by this function.
@@ -204,11 +204,21 @@ impl FunctionProperties {
         self.arg_writes.extend(props.arg_writes.iter());
         self.has_access_indices |= props.has_expr_access;
     }
+
+    pub const fn get_subexpr_map(
+        &self,
+    ) -> &FastHashMap<Handle<Expression>, std::cell::RefCell<FastHashSet<TrackedVar>>> {
+        &self.subexpr_map
+    }
+
+    pub const fn get_exprs_with_accesses(&self) -> &FastHashSet<Handle<Expression>> {
+        &self.exprs_with_accesses
+    }
 }
 
 /// Sets of variables that are read from.
 #[derive(Debug, Clone, Default)]
-struct VarSet {
+pub struct VarSet {
     /// Global variables
     gvars: FastHashSet<Handle<GlobalVariable>>,
     /// Global Constants
@@ -288,19 +298,51 @@ impl VarSetInsert<TrackedVar> for VarSet {
     }
 }
 
+/// StatementProperties are calculated by the visitor phase. They contain the
+/// information about the statements within a statement. The kind of information
+/// contained depends on the kind of statement.
+///
+/// Any statement that may contain other statements (Blocks, or statements like `If` that contain blocks)
+///
 #[derive(Debug, Clone, Default)]
-struct StatementProperties {
+pub struct StatementProperties {
     /// Var set for variables that drive control flow for the statement.
-    control_flow_vars: VarSet,
+    pub control_flow_vars: VarSet,
     /// Var set for variables that store statements depend on.
-    store_reads: VarSet,
+    pub store_reads: VarSet,
 
-    /// Variables that are written to in this statement (sub-statements if this is a block).
-    glbl_writes: FastHashSet<Handle<GlobalVariable>>,
-    lcl_writes: FastHashSet<Handle<LocalVariable>>,
-    arg_writes: FastHashSet<u32>,
+    /// Set of handles to [`GlobalVariable]`s that are written by this statement or sub-statements.
+    ///
+    /// This should only be populated for [`Atomic`], [`Store`] and [`Call`] statements,
+    /// or compound statements containing such statements.
+    ///
+    /// [`Atomic`]: crate::Statement::Atomic
+    /// [`Store`]: crate::Statement::Store
+    /// [`Call`]: crate::Statement::Call
+    pub glbl_writes: FastHashSet<Handle<GlobalVariable>>,
 
-    has_expr_access: bool,
+    /// Set of handles to [`LocalVariable`]s that are written by this statement or sub-statements.
+    ///
+    /// This should only be populated for [`Store`] and [`Call`] statements, or compound statements that contain such statements.
+    ///
+    ///
+    /// [`LocalVariables`]: crate::LocalVariable
+    /// [`Atomic`]: crate::Statement::Atomic
+    /// [`Store`]: crate::Statement::Store
+    /// [`Call`]: crate::Statement::Call
+    pub lcl_writes: FastHashSet<Handle<LocalVariable>>,
+    /// Set of indices of function arguments that are written by this statement or sub-statements.
+    ///
+    /// The indices here correspond to the index of the argument in the argument list of this statement's function.
+    ///
+    /// [`Expression::FunctionArgument`]: crate::Expression::FunctionArgument
+    pub arg_writes: FastHashSet<u32>,
+
+    /// Marks whether the statement, or any sub-statements, contain an access index expression into a buffer
+    /// that is tracked according to the policies in [`AddressSpacesToCheck`].
+    ///
+    /// [`AddressSpacesToCheck`]: super::AddressSpacesToCheck
+    pub(super) has_expr_access: bool,
 
     /// Whether this statement is guaranteed to terminate the block.
     ///
@@ -310,15 +352,35 @@ struct StatementProperties {
     ///
     /// That is, we don't do crazy static analysis when computing this.
     /// We just do a simple check to see if all paths have a terminator (regardless of whether or not all paths are reachable)
-    is_terminator: bool,
-    /// The control flow
-    cf_flags: ControlFlags,
+    pub(super) is_terminator: bool,
+    /// The control flow flags carried by this statement and its sub-statements.
+    ///
+    /// Note that `loops` should never have the `BREAK` or `CONTINUE` flags set,
+    /// as in WGSL, as all `continue` and `loop` statements that appear within a loop only target
+    /// the innermost loop.
+    ///
+    /// In other words, those flags will not be set for loops whose bodies may contain them.
+    pub(super) cf_flags: ControlFlags,
 
-    /// There is a function call in this statement
-    has_call: bool,
+    /// Whether this statement has a function call.
+    ///
+    /// The purpose of this field is to determine whether the statement may be required to be visited.
+    pub(super) has_call: bool,
 
-    /// Whether the statement has been marked as requiring to be visited by the visitor.
+    /// Whether the statement has been marked as requiring to be visited by the visitor due to it having a marked sub-statement.
+    ///
+    /// A statement is marked if
+    /// - It is a compound statement and any sub statements are marked.
+    /// - It contains an access index expression into a buffer that is tracked according to the policies in [`AddressSpacesToCheck`].
+    /// - It contains any sort of control flow statement for a block that is marked
+    /// - It contains a write to any variable that is marked.
     marked: bool,
+
+    /// Whether the store statment must be visited because it writes to a marked expression.
+    /// A `store` may be visited for one of two reasons: It writes to a marked variable, or it contains an access index.
+    ///
+    /// It is useful for a consumer of this data to be able to know why the statement is marked.
+    marked_writes: bool,
 }
 
 trait HasWrites {
@@ -394,6 +456,12 @@ impl StatementProperties {
     pub const fn is_marked(&self) -> bool {
         self.marked
     }
+
+    /// Return whether or not this statement writes to a marked expression.
+    #[inline]
+    pub const fn writes_to_marked(&self) -> bool {
+        self.marked_writes
+    }
     /// Merges the writes for glbl, lcl, and args. Also merges `has_expr_access` using logical OR, and `cf_flags` using bitwise OR.
     fn merge_with(&mut self, other: &Self) {
         // Joining two properties ONLY joins the variables that are written to, along with whether it contains an expr access.
@@ -418,28 +486,32 @@ impl StatementProperties {
                 && self.arg_writes.is_empty())
     }
 
-    const fn has_ret(&self) -> bool {
+    pub const fn has_ret(&self) -> bool {
         self.cf_flags.contains(ControlFlags::RETURN)
     }
 
-    const fn has_break_or_continue(&self) -> bool {
+    pub const fn has_break_or_continue(&self) -> bool {
         self.cf_flags
             .intersects(ControlFlags::BREAK.union(ControlFlags::CONTINUE))
     }
 
-    const fn has_break(&self) -> bool {
+    pub const fn has_break(&self) -> bool {
         self.cf_flags.contains(ControlFlags::BREAK)
     }
 
-    const fn has_continue(&self) -> bool {
+    pub const fn has_continue(&self) -> bool {
         self.cf_flags.contains(ControlFlags::CONTINUE)
+    }
+
+    pub const fn is_terminator(&self) -> bool {
+        self.is_terminator
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 // These are all of the statement variants that can contain other statements.
 // We can build up a path of these statements..
-enum StatementPathPart {
+pub enum StatementPathPart {
     /// The index of the function
     EntryPoint(EntryPointIndex),
     // The handle of the function
@@ -459,16 +531,22 @@ enum StatementPathPart {
     Case(usize),
 
     /// The `loop body` for the loop.
-    LoopBody(usize),
+    LoopBody,
 
     /// The `loop continuing` for the loop.
-    LoopContinuing(usize),
+    LoopContinuing,
 }
 
 /// This is a type wrapper around an index corresponding to an Entry Point.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[repr(transparent)]
-struct EntryPointIndex(usize);
+pub struct EntryPointIndex(pub usize);
+
+impl EntryPointIndex {
+    pub fn new<T: Into<usize>>(index: T) -> Self {
+        Self(index.into())
+    }
+}
 
 impl From<EntryPointIndex> for usize {
     fn from(index: EntryPointIndex) -> Self {
@@ -481,7 +559,6 @@ impl From<usize> for EntryPointIndex {
         EntryPointIndex(index)
     }
 }
-
 /// ModuleStatementBuilder is the first phase of the visitor.
 ///
 /// In step 1, we visit every expression in each function's arena. Step 1 is accomplished by [`VarVisitor`].
@@ -650,7 +727,11 @@ impl crate::TypeInner {
     ///
     /// [`indexable_length`]: crate::TypeInner::indexable_length
     /// [`TypeInner::Struct`]: crate::TypeInner::Struct
-    fn is_indexable(&self, module: &crate::Module, config: AddressSpacesToCheck) -> bool {
+    pub(super) fn is_indexable(
+        &self,
+        module: &crate::Module,
+        config: AddressSpacesToCheck,
+    ) -> bool {
         use crate::TypeInner as Ti;
         match *self {
             Ti::Vector { .. }
@@ -778,36 +859,41 @@ impl<'module> ModuleStatementBuilder<'module> {
         // accesses we don't care to check the bounds of.
         // E.g., if we want to turn off checking bounds for Uniforms, then that logic would go in this function.
         // Specifically, one would modify the `is_indexable` function
-        let build_property_for_fn =
-            |func: &crate::Function| -> Result<FunctionProperties, VisitorError> {
-                let visitor_result = VarVisitor::visit_arena(
-                    &func.expressions,
-                    &func.local_variables,
-                    &self.module.global_variables,
-                    &self.module.global_expressions,
-                    Box::new(|e: Handle<Expression>| {
-                        self.module_info[e]
-                            .inner_with(&self.module.types)
-                            .is_indexable(self.module, self.address_space_config)
-                    }),
-                )?;
-                Ok(FunctionProperties {
-                    subexpr_map: visitor_result.subexpr_map,
-                    exprs_with_accesses: visitor_result.exprs_with_accesses,
-                    index_access_dependencies: visitor_result.index_access_dependencies,
-                    ..Default::default()
-                })
-            };
+
+        let build_property_for_fn = |func: &crate::Function,
+                                     info: &crate::valid::FunctionInfo|
+         -> Result<FunctionProperties, VisitorError> {
+            let visitor_result = VarVisitor::visit_arena(
+                &func.expressions,
+                &func.local_variables,
+                &self.module.global_variables,
+                &self.module.global_expressions,
+                Box::new(|e: Handle<Expression>| {
+                    info[e]
+                        .ty
+                        .inner_with(&self.module.types)
+                        .is_indexable(self.module, self.address_space_config)
+                }),
+            )?;
+            Ok(FunctionProperties {
+                subexpr_map: visitor_result.subexpr_map,
+                has_access_indices: !visitor_result.exprs_with_accesses.is_empty(),
+                exprs_with_accesses: visitor_result.exprs_with_accesses,
+                index_access_dependencies: visitor_result.index_access_dependencies,
+                ..Default::default()
+            })
+        };
 
         // Go through the functions in the module
         for (fun_handle, fun) in self.module.functions.iter() {
-            let new_fn_props = build_property_for_fn(fun)?;
+            let new_fn_props = build_property_for_fn(fun, &self.module_info[fun_handle])?;
             self.fn_reads.insert(fun_handle, new_fn_props);
         }
 
         // Now do the same for Entry points.
         for (ep_index, ep) in self.module.entry_points.iter().enumerate() {
-            let new_ep_props = build_property_for_fn(&ep.function)?;
+            let new_ep_props =
+                build_property_for_fn(&ep.function, self.module_info.get_entry_point(ep_index))?;
             self.ep_reads.insert(ep_index.into(), new_ep_props);
         }
 
@@ -855,7 +941,7 @@ impl<'module> ModuleStatementBuilder<'module> {
             builder
                 .fn_reads
                 .get_mut(&fun_handle)
-                .unwrap()
+                .expect("All referenced functions should have computed properties during visit. ")
                 .merge_from_statement_properties(&builder.current_properties);
 
             builder.current_path.pop();
@@ -888,7 +974,7 @@ pub enum PointerBase {
 ///
 /// [`VarVisitor`]: self::VarVisitor
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum TrackedVar {
+pub enum TrackedVar {
     LocalVariable(Handle<LocalVariable>),
     GlobalVariable(Handle<GlobalVariable>),
     FunctionArgument(u32),
@@ -903,7 +989,7 @@ impl TrackedVar {
     ///
     /// # Panics
     /// Panics if the path is not a function or entry point.
-    fn into_marked_expr_key_with(self, path: &StatementPathPart) -> MarkedExprKey {
+    pub(super) fn into_marked_expr_key_with(self, path: &StatementPathPart) -> MarkedExprKey {
         match self {
             TrackedVar::LocalVariable(l) => l.as_marked_key_with(path),
             TrackedVar::GlobalVariable(g) => MarkedExprKey::GlobalVariable(g),
@@ -940,10 +1026,15 @@ impl TryFrom<&Expression> for TrackedVar {
         match *value {
             E::LocalVariable(l) => Ok(Self::LocalVariable(l)),
             E::GlobalVariable(g) => Ok(Self::GlobalVariable(g)),
-
             E::FunctionArgument(i) => Ok(Self::FunctionArgument(i)),
             _ => Err("Can't convert to tracked expression."),
         }
+    }
+}
+
+impl TrackedVar {
+    const fn from_call_result(call_result: Handle<Expression>) -> Self {
+        TrackedVar::CallResult(call_result)
     }
 }
 
@@ -1008,6 +1099,10 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
     // 4. Write the now populated `self.current_properties` into the statement map for the current path
     // 5. Restore the old properties.
     fn visit_Statement(&mut self, statement: &Statement) -> Result<(), VisitorError> {
+        // We never visit Emits.
+        if let Statement::Emit(_) = *statement {
+            return Ok(());
+        }
         // If the statement is a block, then bypass the default visitor and call the block visitor.
         // This is because the merge writes, etc. is also done by the block visitor.
         if let Statement::Block(ref block) = *statement {
@@ -1020,7 +1115,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
         self.default_visit_Statement(statement)?;
 
         // Mark whether the statement is a terminator here.
-        self.current_properties.is_terminator = statement.is_terminator();
+        self.current_properties.is_terminator |= statement.is_terminator();
 
         // Afterwards, we will have computed the properties of this statement. Thus, we merge the statement's
         // properties into the old properties so that they can be tied together.
@@ -1041,7 +1136,12 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
         let mut old_properties = std::mem::take(&mut self.current_properties);
         // For blocks, I don't care about anything other than the variables they write to, and the control flow they have.
         // If we see a return, break, or continue, then we stop processing the rest of the elements.
-        for (index, statement) in block.iter().enumerate() {
+        for (index, statement) in block
+            .iter()
+            .filter(|&e| !matches!(*e, Statement::Emit(_)))
+            .enumerate()
+        {
+            // I don't visit emits.
             self.current_path.push(StatementPathPart::Index(index));
             self.visit_Statement(statement)?;
             // Unwrap unsafe is OK here, since visit_Statement ALWAYS sets the current properties if its result was `Ok`
@@ -1080,6 +1180,8 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
             _ => unreachable!("Store statement not in function or entry point."),
         };
 
+        self.mark_access_indices_many(&[pointer, value])?;
+
         // Descend through the pointer chain, marking expressions used as indices as dependencies to a store.
         // When the store culminates in a variable, we mark that variable as the one written to.
         let mut current = pointer;
@@ -1091,9 +1193,11 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
                 }
                 Expression::GlobalVariable(g) => {
                     self.current_properties.glbl_writes.insert(g);
+                    break;
                 }
                 Expression::FunctionArgument(a) => {
                     self.current_properties.arg_writes.insert(a);
+                    break;
                 }
                 Expression::Access { base, index } => {
                     self.update_with_read_set(index, ScopeKind::StoreRead)?;
@@ -1108,6 +1212,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
 
         // Visit the value expression, marking it as a dependency for the store.
         self.update_with_read_set(value, ScopeKind::StoreRead)?;
+        // The read set should be populated.
         Ok(())
     }
 
@@ -1117,6 +1222,8 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
         accept: &Block,
         reject: &Block,
     ) -> Result<(), VisitorError> {
+        // Mark whether the condition contains an access index.
+        self.mark_access_indices(condition)?;
         self.update_with_read_set(condition, ScopeKind::ControlFlow)?;
 
         self.current_path.push(StatementPathPart::Accept);
@@ -1124,7 +1231,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
         let accept_is_terminator = self
             .statement_map
             .get(&self.current_path)
-            .unwrap()
+            .expect("Statement map should be populated after visit.")
             .is_terminator;
         self.current_path.pop();
 
@@ -1133,7 +1240,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
         let reject_is_terminator = self
             .statement_map
             .get(&self.current_path)
-            .unwrap()
+            .expect("Statement map should be populated after visit.")
             .is_terminator;
         self.current_path.pop();
 
@@ -1173,17 +1280,18 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
         continuing: &Block,
         break_if: Option<Handle<Expression>>,
     ) -> Result<(), VisitorError> {
-        self.current_path.push(StatementPathPart::LoopBody(0));
+        self.current_path.push(StatementPathPart::LoopBody);
         self.visit_Block(body)?;
         self.current_path.pop();
 
-        self.current_path.push(StatementPathPart::LoopContinuing(0));
+        self.current_path.push(StatementPathPart::LoopContinuing);
         self.visit_Block(continuing)?;
         self.current_path.pop();
 
         // After visiting the `body` and the `continuing`, we update the control flow dependencies for the loop.
         // That is, in addition to the `break_if` and
         if let Some(break_if) = break_if {
+            self.mark_access_indices(break_if);
             self.update_with_read_set(break_if, ScopeKind::ControlFlow)?;
         }
 
@@ -1200,6 +1308,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
     fn visit_Return(&mut self, value: Option<Handle<Expression>>) -> Result<(), VisitorError> {
         self.current_properties.cf_flags |= ControlFlags::RETURN;
         if let Some(value) = value {
+            self.mark_access_indices(value);
             self.update_with_read_set(value, ScopeKind::RetRead)?;
         }
         // We also need to propagate the control flow dependencies up to the body of the fn.
@@ -1256,7 +1365,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
     ) -> Result<(), VisitorError> {
         self.mark_access_indices_many(arguments);
         // Go through the function's indices.
-        let fn_props = self.fn_reads.get(&function).unwrap(); // We want to panic if the function couldn't be found. This is a bug in the visitor.
+        let fn_props = self.fn_reads.get(&function).unwrap(); // We want to panic if the function couldn't be found. This indicates a bug in the visitor.
 
         self.current_properties.has_expr_access |= fn_props.has_access_indices;
         self.current_properties.has_call = true;
@@ -1277,6 +1386,7 @@ impl StatementVisitor<VisitorError> for ModuleStatementBuilder<'_> {
                 unreachable!();
             };
             let my_props = get_cur_fn_props!(self, get)?;
+
             // Get the fn props of `other`.
             let other_props = self.fn_reads.get(&other_fn_handle).unwrap(); // If the other couldn't be found, we have a bug in the visitor. We want to panic.
 
@@ -1406,10 +1516,52 @@ struct ModuleStatementBuilderPhase2<'module> {
     ep_reads: FastHashMap<EntryPointIndex, FunctionProperties>,
     fn_reads: FastHashMap<Handle<crate::Function>, FunctionProperties>,
     marked_any: bool,
-    /// Whether a statement within was marked.
-    did_mark_statement: bool,
     /// Tracks different things that may need to be visited.
     marked_exprs: FastHashSet<MarkedExprKey>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ModuleVisitorInfo {
+    pub marked_exprs: FastHashSet<MarkedExprKey>,
+    pub ep_reads: FastHashMap<EntryPointIndex, FunctionProperties>,
+    pub fn_reads: FastHashMap<Handle<crate::Function>, FunctionProperties>,
+    pub statement_map: FastHashMap<Vec<StatementPathPart>, StatementProperties>,
+}
+
+impl ModuleVisitorInfo {
+    const fn get_statement_map(&self) -> &FastHashMap<Vec<StatementPathPart>, StatementProperties> {
+        &self.statement_map
+    }
+    const fn get_ep_reads(&self) -> &FastHashMap<EntryPointIndex, FunctionProperties> {
+        &self.ep_reads
+    }
+    const fn get_fn_reads(&self) -> &FastHashMap<Handle<crate::Function>, FunctionProperties> {
+        &self.fn_reads
+    }
+    /// Return whether the given key is marked.
+    fn is_marked(&self, key: &MarkedExprKey) -> bool {
+        self.marked_exprs.contains(key)
+    }
+
+    fn is_global_marked(&self, key: Handle<GlobalVariable>) -> bool {
+        self.is_marked(&MarkedExprKey::GlobalVariable(key))
+    }
+
+    fn is_local_marked_ep(
+        &self,
+        local_handle: Handle<LocalVariable>,
+        ep_idx: EntryPointIndex,
+    ) -> bool {
+        self.is_marked(&MarkedExprKey::EntryPointLocal(ep_idx, local_handle))
+    }
+
+    fn is_local_marked_fn(
+        &self,
+        local_handle: Handle<LocalVariable>,
+        fn_handle: Handle<crate::Function>,
+    ) -> bool {
+        self.is_marked(&MarkedExprKey::FunctionLocal(fn_handle, local_handle))
+    }
 }
 
 impl<'module> From<ModuleStatementBuilder<'module>> for ModuleStatementBuilderPhase2<'module> {
@@ -1425,7 +1577,6 @@ impl<'module> From<ModuleStatementBuilder<'module>> for ModuleStatementBuilderPh
             fn_reads: builder.fn_reads,
             marked_any: false,
             marked_exprs: FastHashSet::default(),
-            did_mark_statement: false,
         }
     }
 }
@@ -1450,7 +1601,39 @@ impl std::ops::Index<Handle<crate::Function>> for crate::Module {
     }
 }
 
-impl ModuleStatementBuilderPhase2<'_> {
+impl<'module> ModuleStatementBuilderPhase2<'module> {
+    /// Marks the statement at the current path if it has any writes to a marked variable.
+    ///
+    /// # Side effects
+    /// If the statement at the current path was not marked, then it becomes marked.
+    #[inline]
+    fn mark_props_from_current(&mut self) -> bool {
+        let curr_path = &self.current_path[0];
+
+        let props = self.statement_map.get_mut(&self.current_path).unwrap();
+
+        let writes_to_marked = props.arg_writes.iter().any(|&arg| {
+            self.marked_exprs
+                .contains(&arg.as_marked_key_with(curr_path))
+        }) || props.lcl_writes.iter().any(|&lcl| {
+            self.marked_exprs
+                .contains(&lcl.as_marked_key_with(curr_path))
+        }) || props.glbl_writes.iter().any(|&glbl| {
+            self.marked_exprs
+                .contains(&glbl.as_marked_key_with(curr_path))
+        });
+
+        props.marked_writes = writes_to_marked;
+
+        props.marked = props.marked
+            || props.has_expr_access
+            || writes_to_marked
+            || (props.has_ret()
+                && get_cur_fn_props!(self, get).unwrap().has_access_indices
+                && matches!(self.current_path[0], StatementPathPart::Function(handle) if self.marked_exprs.contains(&MarkedExprKey::Function(handle))));
+
+        props.marked
+    }
     fn get_current_expr_arena(&self) -> Result<&Arena<Expression>, VisitorError> {
         let path = self.current_path.first().unwrap_or_else(|| {
             unreachable!("Expect first element of path to be function or entry point.")
@@ -1474,7 +1657,7 @@ impl ModuleStatementBuilderPhase2<'_> {
     // contains either of the above.
     // All other statements can be safely ignored. This allows us to skip over statements that don't matter.
 
-    fn build(phase1: ModuleStatementBuilder<'_>) -> Result<(), VisitorError> {
+    fn build(phase1: ModuleStatementBuilder<'module>) -> Result<Self, VisitorError> {
         macro_rules! mark_fn_body {
             (@step1 $(,)? $builder:ident, $fn_iter_expr:expr, $fn_iter:expr, $arg_variant:expr, $call_variant:expr, $local_variant:expr, $statement_path_expr:expr $(,)?) => {
                 // Part 1. Mark all expressions used as access indices.
@@ -1545,7 +1728,7 @@ impl ModuleStatementBuilderPhase2<'_> {
             mark_fn_body! {@function @step2, builder, module};
         }
 
-        Ok(())
+        Ok(builder)
     }
 
     fn get_current_statement_props(&self) -> Option<&StatementProperties> {
@@ -1583,6 +1766,35 @@ impl VarSet {
     }
 }
 
+macro_rules! mark_stmt_impl {
+    ($self:ident) => {
+        let props = $self.get_current_statement_props()?;
+        if props.has_expr_access
+            || props.has_ret()
+            || props.arg_writes.iter().any(|&arg| {
+                $self
+                    .marked_exprs
+                    .contains(&arg.as_marked_key_with(&$self.current_path[0]))
+            })
+            || props.lcl_writes.iter().any(|&lcl| {
+                $self
+                    .marked_exprs
+                    .contains(&lcl.as_marked_key_with(&$self.current_path[0]))
+            })
+            || props.glbl_writes.iter().any(|&glbl| {
+                $self
+                    .marked_exprs
+                    .contains(&glbl.as_marked_key_with(&$self.current_path[0]))
+            })
+        {
+            $self.did_mark_statement = true;
+            $self.marked_any |= props
+                .store_reads
+                .mark_all($self.current_path[0], &mut $self.marked_exprs);
+        }
+    };
+}
+
 /// This visitor implementation drives portions 2 and 3 of step 2.
 /// At this point, all expressions that are used as access indices have been marked.
 /// What this does is marks all expressions that are dependencies of a store to a marked expression,
@@ -1601,93 +1813,89 @@ impl VarSet {
 /// for statements that contain other statements.
 ///
 /// This is because we can mark statements based on the properties they already computed.
-
 impl<'module> StatementVisitor<VisitorError> for ModuleStatementBuilderPhase2<'module> {
-    // Mark all stores to marked variables.
-    fn visit_Store(
-        &mut self,
-        pointer: Handle<Expression>,
-        value: Handle<Expression>,
-    ) -> Result<(), VisitorError> {
-        let current_path = &self.current_path[0];
-        // Get the props for this statement.
-        // We already computed the local, global, or arg we stored to, so just use it here.
-        let props = self.statement_map.get(&self.current_path).unwrap();
-        if props.lcl_writes.iter().any(|&lcl| {
-            self.marked_exprs
-                .contains(&lcl.as_marked_key_with(current_path))
-        }) || props.glbl_writes.iter().any(|&glbl| {
-            self.marked_exprs
-                .contains(&glbl.as_marked_key_with(current_path))
-        }) || props.arg_writes.iter().any(|&arg| {
-            self.marked_exprs
-                .contains(&arg.as_marked_key_with(current_path))
-        }) {
-            self.marked_any |= props
-                .store_reads
-                .mark_all(self.current_path[0], &mut self.marked_exprs);
-        }
-
-        Ok(())
-    }
     /// Before calling default_visit, we mark the statement if we know that it contains a store to a marked expression.
     ///
     /// # Panics
     /// Panics if the current statement does not exist in the property map.
     fn visit_Statement(&mut self, statement: &Statement) -> Result<(), VisitorError> {
-        // let props = self.statement_map.get_mut(&self.current_path).unwrap();
-        // Only visit a statement if it might need to be visited.
+        // If the statement is a block, then we go directly to that method instead.
+        if let Statement::Emit(_) = *statement {
+            return Ok(());
+        }
+        if let Statement::Block(ref block) = *statement {
+            return self.visit_Block(block);
+        }
 
         let (may_need_visit, is_marked) = {
-            let tmp = self.statement_map.get(&self.current_path).unwrap();
+            let tmp = self
+                .statement_map
+                .get(&self.current_path)
+                .unwrap_or_else(|| {
+                    unreachable!("Visited statements should always exist in the map.")
+                });
             (tmp.may_need_visit(), tmp.marked)
         };
 
-        if may_need_visit && !is_marked {
-            // Visit the statement.
-            let curr_path = &self.current_path[0];
-
-            let props = self.statement_map.get_mut(&self.current_path).unwrap();
-
-            props.marked = props.marked
-                // Case 1: We have an expression access
-                || props.has_expr_access
-                // Case 2: We have a return statement, and this function either has access indices,
-                // a store to a marked variable, or 
-                || (props.has_ret()
-                    && get_cur_fn_props!(self, get)?.has_access_indices
-                    && matches!(self.current_path[0], StatementPathPart::Function(handle) if self.marked_exprs.contains(&MarkedExprKey::Function(handle))))
-                || props.arg_writes.iter().any(|&arg| {
-                    self.marked_exprs
-                        .contains(&arg.as_marked_key_with(curr_path))
-                })
-                || props.lcl_writes.iter().any(|&lcl| {
-                    self.marked_exprs
-                        .contains(&lcl.as_marked_key_with(curr_path))
-                })
-                || props.glbl_writes.iter().any(|&glbl| {
-                    self.marked_exprs
-                        .contains(&glbl.as_marked_key_with(curr_path))
-                });
-
-            // If it was not marked before
-            self.marked_any |= props.marked;
+        if may_need_visit && !is_marked && self.mark_props_from_current() {
+            self.marked_any |= true;
+            let props = self.statement_map.get(&self.current_path).unwrap();
+            // Add all control flow variables to the marked set.
+            // If we are an `if`, `loop`, or `switch`, then we mark all control flow variables.
+            // If we are a `store`, then we mark all control flow variables that are dependencies of the store.
+            match *statement {
+                Statement::If { .. } | Statement::Loop { .. } | Statement::Switch { .. } => {
+                    self.marked_any |= props
+                        .control_flow_vars
+                        .mark_all(self.current_path[0], &mut self.marked_exprs);
+                }
+                Statement::Atomic { .. } | Statement::Store { .. } => {
+                    self.marked_any |= props
+                        .store_reads
+                        .mark_all(self.current_path[0], &mut self.marked_exprs);
+                }
+                _ => {}
+            }
         }
 
-        if may_need_visit {
+        if may_need_visit
+            && !matches!(
+                *statement,
+                Statement::Store { .. } | Statement::Atomic { .. }
+            )
+        {
             self.default_visit_Statement(statement)
         } else {
             Ok(())
         }
     }
 
+    /// In visit_block, we modify `self.did_mark_statement` depending on if
+    /// any statements in the block were newly marked.
     fn visit_Block(&mut self, block: &Block) -> Result<(), VisitorError> {
+        let (may_need_visit, is_marked) = {
+            let tmp = self.statement_map.get(&self.current_path).unwrap();
+            (tmp.may_need_visit(), tmp.marked)
+        };
+
+        // This is the same as above.
+        if may_need_visit && !is_marked {
+            self.mark_props_from_current();
+        }
+
+        // Blocks themselves do not become `marked`. They will always be visited.
         // Only visit a block if it might need to be visited.
+        // When we visit a block, we turn off `did_mark`
         let props = self.get_current_statement_props().unwrap();
         if props.may_need_visit() {
-            for (index, statement) in block.iter().enumerate() {
+            for (index, statement) in block
+                .iter()
+                .filter(|&e| !matches!(*e, Statement::Emit(_)))
+                .enumerate()
+            {
                 self.current_path.push(StatementPathPart::Index(index));
                 self.visit_Statement(statement)?;
+                // After visiting, we clear the marked statement flag, but track if we marked any.
 
                 let last_was_terminator = self
                     .statement_map
@@ -1699,6 +1907,37 @@ impl<'module> StatementVisitor<VisitorError> for ModuleStatementBuilderPhase2<'m
                     break;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    fn visit_Loop(
+        &mut self,
+        body: &Block,
+        continuing: &Block,
+        break_if: Option<Handle<Expression>>,
+    ) -> Result<(), VisitorError> {
+        self.current_path.push(StatementPathPart::LoopBody);
+        self.visit_Block(body)?;
+        self.current_path.pop();
+
+        self.current_path.push(StatementPathPart::LoopContinuing);
+        self.visit_Block(continuing)?;
+        self.current_path.pop();
+
+        Ok(())
+    }
+
+    fn visit_Switch(
+        &mut self,
+        selector: Handle<Expression>,
+        cases: &Vec<SwitchCase>,
+    ) -> Result<(), VisitorError> {
+        for (case_idx, case) in cases.iter().enumerate() {
+            self.current_path.push(StatementPathPart::Case(case_idx));
+            self.visit_Block(&case.body)?;
+            self.current_path.pop();
         }
         Ok(())
     }
@@ -1717,11 +1956,6 @@ impl<'module> StatementVisitor<VisitorError> for ModuleStatementBuilderPhase2<'m
         self.visit_Block(reject);
         self.current_path.pop();
 
-        let props = self.statement_map.get_mut(&self.current_path).unwrap();
-        props
-            .control_flow_vars
-            .mark_all(self.current_path[0], &mut self.marked_exprs);
-
         Ok(())
     }
 
@@ -1734,7 +1968,7 @@ impl<'module> StatementVisitor<VisitorError> for ModuleStatementBuilderPhase2<'m
         // Determine if the call needs to be visited.
         // It needs to be visited if:
         // 1. It contains an access index
-        //  In this case, we mark all of our arguments that flow into the call.
+        //  In this case, we mark all of our arguments whose corresponding
         // 2. It contains an access index
         // 3.
 
@@ -1746,51 +1980,417 @@ impl<'module> StatementVisitor<VisitorError> for ModuleStatementBuilderPhase2<'m
             .get(&function)
             .ok_or(VisitorError::NotFound("Function"))?;
 
+        let mut needs_mark = false;
+
+        // Mark the arguments to the other function.
+        let our_subexpr = &get_cur_fn_props!(self, get).unwrap().subexpr_map;
+        let our_arena = self.get_current_expr_arena().unwrap();
+        for (idx, arg) in arguments.iter().enumerate() {
+            if self
+                .marked_exprs
+                .contains(&MarkedExprKey::FunctionArgument(function, idx as u32))
+            {
+                needs_mark = true;
+                // We mark all arguments in the subexpr map.
+
+                let as_tracked_expr = match self.get_current_expr_arena().unwrap()[*arg] {
+                    Expression::CallResult(_) => Some(TrackedVar::from_call_result(*arg)),
+                    Expression::GlobalVariable(g) => Some(TrackedVar::GlobalVariable(g)),
+                    Expression::LocalVariable(l) => Some(TrackedVar::LocalVariable(l)),
+                    Expression::FunctionArgument(a) => Some(TrackedVar::FunctionArgument(a)),
+                    _ => None,
+                }
+                .map(|e| e.into_marked_expr_key_with(&self.current_path[0]));
+
+                self.marked_exprs.extend(
+                    unsafe { our_subexpr.get(arg).unwrap().try_borrow_unguarded() }
+                        .map_err(|e| VisitorError::bad_handle(*arg))?
+                        .iter()
+                        .map(|e| e.into_marked_expr_key_with(&self.current_path[0]))
+                        .chain(as_tracked_expr.iter().copied()),
+                );
+            }
+        }
+
         if other_fn_props.is_marked {
             self.statement_map
                 .get_mut(&self.current_path)
                 .unwrap()
                 .marked = true;
+
+            for arg in &other_fn_props.arg_writes {
+                // We need the expressions we depend on.
+                // get ourself as a tracked expr
+                self.marked_any |= self
+                    .marked_exprs
+                    .insert(arg.as_marked_key_with(&self.current_path[0]));
+            }
         }
+
+        // Now, we need to mark the arguments that are marked in the call
 
         Ok(())
     }
 }
 
-mod tests {
+#[cfg(all(test, feature = "wgsl-in"))] // We need `wgsl-in` to test.
+mod builder2_tests {
     use super::*;
     use crate::front::wgsl::parse_str;
     use crate::valid::{Capabilities, ValidationFlags, Validator};
 
-    // Now, let's start by parsing a simple wgsl file.
-    // We can only run the test if the `wgsl-in` feature is enabled.
+    macro_rules! test_harness {
+        ($wgsl:literal, $module:ident, $builder:ident, $validated:ident) => {
+            let $module = parse_str($wgsl).unwrap();
+            let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+            let $validated = validator.validate(&$module).unwrap();
+            let mut builder =
+                ModuleStatementBuilder::build(&$module, &$validated, AddressSpacesToCheck::all())
+                    .unwrap();
+            let $builder = ModuleStatementBuilderPhase2::build(builder).unwrap();
+        };
+    }
+
+    /// Get the handle for a global variable in `module` and
+    /// return whetehr or not it is marked in `builder`.
+    macro_rules! check_gvar_marked {
+        ($module:ident, $builder:ident, $gvar:expr) => {
+            $builder
+                .marked_exprs
+                .contains(&MarkedExprKey::GlobalVariable(
+                    $module
+                        .global_variables
+                        .fetch_if(|g| g.name.as_ref().is_some_and(|f| f == $gvar))
+                        .unwrap(),
+                ))
+        };
+    }
+
+    /// Sanity test for the module statement builder.
+    ///
+    /// Checks that the singular function argument used to index into the array is marked after the
     #[test]
-    #[cfg(feature = "wgsl-in")]
     fn simple_test() {
-        let module = parse_str(
-            r#"
-            fn main() {
-                var a : f32;
-                a = 1.0;
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+            fn main(i: u32) {
+                a[i] = 1u;
+                return;
+            }"#,
+            module,
+            builder2,
+            validated
+        );
+        let handle = module.functions.iter().next().unwrap().0;
+        // Make the key, this is
+        let key = MarkedExprKey::FunctionArgument(handle, 0);
+        // Now, we check if the key is marked.
+        assert!(builder2.marked_exprs.contains(&key));
+    }
+
+    // print out the marked variables.
+    fn print_marked_vars(builder: &ModuleStatementBuilderPhase2) {
+        macro_rules! fn_name {
+            ($handle:expr) => {
+                builder.module.functions[*$handle]
+                    .name
+                    .as_ref()
+                    .map(|f| f.as_str())
+                    .unwrap_or("UNNAMED_FUNCTION")
+            };
+        }
+        for var in &builder.marked_exprs {
+            match var {
+                MarkedExprKey::FunctionArgument(handle, idx) => {
+                    println!("Function argument {idx} for {}", fn_name!(handle),);
+                }
+                MarkedExprKey::GlobalVariable(handle) => {
+                    println!(
+                        "Global variable: {}",
+                        builder.module.global_variables[*handle]
+                            .name
+                            .as_ref()
+                            .unwrap(),
+                    );
+                }
+                MarkedExprKey::Function(handle) => {
+                    println!("Function: {}", fn_name!(handle),);
+                }
+                MarkedExprKey::FnCallResult(handle, idx) => {
+                    println!("Call result {idx:?} for {}", fn_name!(handle),);
+                }
+                MarkedExprKey::EpCallResult(EntryPointIndex(ep_idx), idx) => {
+                    println!(
+                        "Call result {idx:?} for {}",
+                        builder.module.entry_points[*ep_idx].name
+                    );
+                }
+                MarkedExprKey::EntryPointArgument(EntryPointIndex(idx), argidx) => {
+                    println!(
+                        "Argument {argidx} to {}",
+                        builder.module.entry_points[*idx].name
+                    );
+                }
+                MarkedExprKey::EntryPointLocal(EntryPointIndex(idx), lcl_handle) => {
+                    println!(
+                        "Local {} in {}",
+                        builder.module.entry_points[*idx].function.local_variables[*lcl_handle]
+                            .name
+                            .as_ref()
+                            .map(|e| e.as_str())
+                            .unwrap_or("UNNAMED_LOCAL"),
+                        builder.module.entry_points[*idx].name
+                    );
+                }
+                MarkedExprKey::FunctionLocal(fn_handle, lcl_handle) => {
+                    println!(
+                        "Local {} in {}",
+                        builder.module.functions[*fn_handle].local_variables[*lcl_handle]
+                            .name
+                            .as_ref()
+                            .map(|e| e.as_str())
+                            .unwrap_or("UNNAMED_LOCAL"),
+                        fn_name!(fn_handle),
+                    );
+                }
             }
-        "#,
-        )
-        .unwrap();
-
-        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
-        let validated = validator.validate(&module).unwrap();
-
-        println!("VALIDATION SUCCESS!");
-
-        // we validate the module to get a builder
-
-        let mut builder =
-            ModuleStatementBuilder::build(&module, &validated, AddressSpacesToCheck::all()).unwrap();
-        
-        // Now let's print out the statement map!
-        for (path, props) in builder.statement_map.iter() {
-            println!("Path: {:?}", path);
-            println!("Properties: {:?}", props);
+            println!("{:?}", var);
         }
     }
+
+    #[test]
+    fn test_glbl_from_subfunction() {
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+            @group(0) @binding(1) var<storage, read_write> idx: u32;
+            fn foo(i: u32) {
+                a[i] = 1u;
+                return;
+            }
+
+            @compute @workgroup_size(1, 1, 1)
+            fn main() {
+                foo(idx);
+            }"#,
+            module,
+            builder2,
+            validated
+        );
+
+        // Now, print what is marked. We should see that the function argument is marked.
+        let result = check_gvar_marked!(module, builder2, "idx");
+        if !result {
+            print_marked_vars(&builder2);
+        }
+        assert!(result);
+    }
+
+    /// Test that a loop variable is marked when the loop contains an array access.
+    #[test]
+    fn test_loop_deps() {
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+               @group(0) @binding(1) var<storage> idx: u32;
+
+            fn foo() {
+                for(var i: u32 = 0u; i < 10u; i = i + 1u) {
+                    a[idx] = i;
+                }
+                return;
+            }"#,
+            module,
+            builder2,
+            validated
+        );
+
+        // Ensure that local variable `i` is marked.)
+        let (fun_handle, fun) = module.functions.iter().next().unwrap();
+        let lvar = fun
+            .local_variables
+            .fetch_if(|l| l.name.as_ref().is_some_and(|f| f == "i"))
+            .unwrap();
+
+        // Ensure the key is marked.
+        let result = builder2
+            .marked_exprs
+            .contains(&MarkedExprKey::FunctionLocal(fun_handle, lvar));
+
+        if !result {
+            print_marked_vars(&builder2);
+        }
+
+        assert!(result);
+    }
+
+    /// Test that a variable is marked when it drives control flow for a statement that contains an access.
+    #[test]
+    fn test_cf_dep() {
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+               @group(0) @binding(1) var<storage> idx: u32;
+            
+            fn foo(i: u32, val: u32) {
+            if (idx < 10u) {
+                a[i] = val;
+            }
+        }"#,
+            module,
+            builder2,
+            validated
+        );
+
+        // `idx` should be marked as it indirectly influences an array access.
+
+        let result = check_gvar_marked!(module, builder2, "idx");
+
+        if !result {
+            print_marked_vars(&builder2);
+        }
+        assert!(result);
+    }
+
+    /// Test that a variable is marked when it drives control flow into a store to a marked variable.
+    #[test]
+    fn test_indirect_cf_dep() {
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+            @group(0) @binding(1) var<storage> control: u32;
+            @group(0) @binding(1) var<storage, read_write> idx: u32;
+            fn foo(i: u32) {
+                if (control < 10u) {
+                    idx = 4u;
+                }
+            
+                a[idx] = 1u;
+            }"#,
+            module,
+            builder2,
+            validated
+        );
+
+        let result = check_gvar_marked! {module, builder2, "control"};
+
+        if !result {
+            print_marked_vars(&builder2);
+        }
+        assert!(result);
+    }
+
+
+    #[test]
+    fn test_atomic() {
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage> a : array<u32>;
+                @group(0) @binding(1) var<storage> b : array<u32>;
+                @group(0) @binding(2) var<storage, read_write> c : array<u32>;
+                @group(0) @binding(3) var<storage> idx: u32;
+
+                var<workgroup> d: atomic<u32>;
+
+                // The simplest loop I can think of.
+                // We have stuff here that we don't need for bounds checks and should be ignored.
+                // We shouldn't panic.
+
+                fn test_loop() {
+                    // this add does nothing for accesses, and should be ignored.
+                    let r = atomicAdd(&d, 1u);
+
+                    c[idx] = a[idx] + b[idx] + r;
+
+                }"#,
+            module,
+            builder,
+            validated
+        );
+
+        // We need to ensure that the `gvar` is marked....
+        // The store statement should be marked.
+        let fun = module.functions.iter().next().unwrap();
+    
+        let fun_handle = fun.0;
+        let fun_props = builder.fn_reads.get(&fun_handle).unwrap();
+
+        let props = builder
+            .statement_map
+            .get(&vec![
+                StatementPathPart::Function(fun_handle),
+                StatementPathPart::Index(0),
+            ])
+            .unwrap();
+
+        // We need to make sure that props is marked as having access index
+        assert!(props.has_expr_access);
+    }
+}
+
+pub fn process_module(
+    module: &crate::Module,
+    module_info: &crate::valid::ModuleInfo,
+    address_space_config: AddressSpacesToCheck,
+) -> Result<ModuleVisitorInfo, VisitorError> {
+    let mut builder2 = ModuleStatementBuilderPhase2::build(ModuleStatementBuilder::build(
+        module,
+        module_info,
+        address_space_config,
+    )?)?;
+
+    Ok(ModuleVisitorInfo {
+        marked_exprs: builder2.marked_exprs,
+        ep_reads: builder2.ep_reads,
+        fn_reads: builder2.fn_reads,
+        statement_map: builder2.statement_map,
+    })
+}
+
+#[cfg(all(test, feature = "wgsl-in"))]
+mod builder1_tests {
+    use super::*;
+    use crate::front::wgsl::parse_str;
+    use crate::valid::{Capabilities, ValidationFlags, Validator};
+
+    macro_rules! test_harness {
+        ($wgsl:literal, $module:ident, $builder:ident, $validated:ident) => {
+            let $module = parse_str($wgsl).unwrap();
+            let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+            let $validated = validator.validate(&$module).unwrap();
+            let $builder =
+                ModuleStatementBuilder::build(&$module, &$validated, AddressSpacesToCheck::all())
+                    .unwrap();
+        };
+    }
+
+    /// Test that a statement with expression access within is marked as having expression access.
+    #[test]
+    fn test_cf_deps() {
+        test_harness!(
+            r#"@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+            @group(0) @binding(1) var<storage> control: u32;
+            @group(0) @binding(1) var<storage, read_write> idx: u32;
+            fn foo(i: u32) {
+                if (control < 10u) {
+                    a[idx] = control;
+                }
+            }"#,
+            module,
+            builder,
+            validated
+        );
+
+        let fun = module.functions.iter().next().unwrap();
+        let fun_handle = fun.0;
+        let fun_props = builder.fn_reads.get(&fun_handle).unwrap();
+
+        let props = builder
+            .statement_map
+            .get(&vec![
+                StatementPathPart::Function(fun_handle),
+                StatementPathPart::Index(0),
+            ])
+            .unwrap();
+
+        // We need to make sure that props is marked as having access index
+        assert!(props.has_expr_access);
+    }
+
+
 }

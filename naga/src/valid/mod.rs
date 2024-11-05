@@ -221,7 +221,7 @@ bitflags::bitflags! {
 pub struct ModuleInfo {
     type_flags: Vec<TypeFlags>,
     functions: Vec<FunctionInfo>,
-    entry_points: Vec<FunctionInfo>,
+    pub entry_points: Vec<FunctionInfo>,
     const_expression_types: Box<[TypeResolution]>,
 }
 
