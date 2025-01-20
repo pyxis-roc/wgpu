@@ -308,8 +308,6 @@ impl ExpressionVisitor<VisitorError> for VarVisitor<'_> {
 }
 // If we saw a break, then we stop iterating future items in the block.
 
-
-
 #[cfg(all(test, feature = "wgsl-in"))]
 mod tests {
     use super::*;
@@ -362,7 +360,7 @@ mod tests {
         let a_expr_handle = fun
             .expressions
             .iter()
-            .find(|(expr_handle, _)| {
+            .find(|&(ref expr_handle, _)| {
                 fun.named_expressions
                     .get(expr_handle)
                     .is_some_and(|name| name == "a")
@@ -400,6 +398,5 @@ mod tests {
             println!("{}", f.print_expr(&fun.expressions, input));
         });
 
-        assert!(true)
     }
 }

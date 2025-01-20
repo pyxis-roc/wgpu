@@ -538,9 +538,18 @@ pub enum StatementPathPart {
 }
 
 /// This is a type wrapper around an index corresponding to an Entry Point.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[repr(transparent)]
 pub struct EntryPointIndex(pub usize);
+
+impl std::ops::Deref for EntryPointIndex {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl EntryPointIndex {
     pub fn new<T: Into<usize>>(index: T) -> Self {
@@ -2068,7 +2077,7 @@ mod builder2_tests {
 
     /// Sanity test for the module statement builder.
     ///
-    /// Checks that the singular function argument used to index into the array is marked after the
+    /// Checks that the singular function argument used to index into the array is marked
     #[test]
     fn simple_test() {
         test_harness!(
@@ -2092,7 +2101,7 @@ mod builder2_tests {
     fn print_marked_vars(builder: &ModuleStatementBuilderPhase2) {
         macro_rules! fn_name {
             ($handle:expr) => {
-                builder.module.functions[*$handle]
+                builder.module.functions[$handle]
                     .name
                     .as_ref()
                     .map(|f| f.as_str())
@@ -2100,14 +2109,14 @@ mod builder2_tests {
             };
         }
         for var in &builder.marked_exprs {
-            match var {
+            match *var {
                 MarkedExprKey::FunctionArgument(handle, idx) => {
                     println!("Function argument {idx} for {}", fn_name!(handle),);
                 }
                 MarkedExprKey::GlobalVariable(handle) => {
                     println!(
                         "Global variable: {}",
-                        builder.module.global_variables[*handle]
+                        builder.module.global_variables[handle]
                             .name
                             .as_ref()
                             .unwrap(),
@@ -2122,33 +2131,31 @@ mod builder2_tests {
                 MarkedExprKey::EpCallResult(EntryPointIndex(ep_idx), idx) => {
                     println!(
                         "Call result {idx:?} for {}",
-                        builder.module.entry_points[*ep_idx].name
+                        builder.module.entry_points[ep_idx].name
                     );
                 }
                 MarkedExprKey::EntryPointArgument(EntryPointIndex(idx), argidx) => {
                     println!(
                         "Argument {argidx} to {}",
-                        builder.module.entry_points[*idx].name
+                        builder.module.entry_points[idx].name
                     );
                 }
                 MarkedExprKey::EntryPointLocal(EntryPointIndex(idx), lcl_handle) => {
                     println!(
                         "Local {} in {}",
-                        builder.module.entry_points[*idx].function.local_variables[*lcl_handle]
+                        builder.module.entry_points[idx].function.local_variables[lcl_handle]
                             .name
-                            .as_ref()
-                            .map(|e| e.as_str())
+                            .as_deref()
                             .unwrap_or("UNNAMED_LOCAL"),
-                        builder.module.entry_points[*idx].name
+                        builder.module.entry_points[idx].name
                     );
                 }
                 MarkedExprKey::FunctionLocal(fn_handle, lcl_handle) => {
                     println!(
                         "Local {} in {}",
-                        builder.module.functions[*fn_handle].local_variables[*lcl_handle]
+                        builder.module.functions[fn_handle].local_variables[lcl_handle]
                             .name
-                            .as_ref()
-                            .map(|e| e.as_str())
+                            .as_deref()
                             .unwrap_or("UNNAMED_LOCAL"),
                         fn_name!(fn_handle),
                     );
@@ -2276,7 +2283,6 @@ mod builder2_tests {
         assert!(result);
     }
 
-
     #[test]
     fn test_atomic() {
         test_harness!(
@@ -2306,7 +2312,7 @@ mod builder2_tests {
         // We need to ensure that the `gvar` is marked....
         // The store statement should be marked.
         let fun = module.functions.iter().next().unwrap();
-    
+
         let fun_handle = fun.0;
         let fun_props = builder.fn_reads.get(&fun_handle).unwrap();
 
@@ -2391,6 +2397,4 @@ mod builder1_tests {
         // We need to make sure that props is marked as having access index
         assert!(props.has_expr_access);
     }
-
-
 }

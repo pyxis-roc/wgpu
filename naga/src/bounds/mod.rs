@@ -4,8 +4,7 @@ mod helper_interface;
 mod utils;
 mod visitor;
 
-// mod visitor;
-
+pub use analyzer::BoundsCheckResult;
 pub use analyzer::BoundsChecker;
 
 bitflags::bitflags! {
@@ -15,7 +14,7 @@ bitflags::bitflags! {
     /// This is different from [`BoundsCheckPolicy`], which dictates how out of bounds accesses should be handled.
     /// Instead, this flag specifies which address spaces should have explicit bounds checks inserted.
     ///
-    /// This is useful for backends that have automatic robustness checks for certain spaces, such as Vulkan and D3D
+    /// Useful for backends that have automatic robustness checks for certain spaces, such as Vulkan and D3D
     ///
     /// [`BoundsCheckPolicy`]: crate::proc::BoundsCheckPolicy
     #[derive(Clone, Copy)]
@@ -64,6 +63,8 @@ pub enum BoundsCheckError {
     BadHandle(#[from] crate::arena::BadHandle),
     #[error("{0}")]
     ConstraintHelperError(#[from] abc_helper::ConstraintError),
+    #[error("{0}")]
+    SolverError(#[from] abc_helper::SolverError),
     #[error("Store to non pointer expression")]
     StoreToNonPointer,
     #[error("Unsupported loop structure detected")]
@@ -73,4 +74,42 @@ pub enum BoundsCheckError {
 
     #[error("VisitorError({0})")]
     VisitorError(#[from] visitor::VisitorError),
+}
+
+
+/// Constructs a JSON report for the provided bounds check results and the source code.
+pub fn report_to_json(constraints: &[BoundsCheckResult], source: &str) -> String {
+    let mut output = String::new();
+    output.extend(&['{', '\n']);
+    let mut constraints = constraints.iter().peekable();
+    while let Some(constraint) = constraints.next() {
+        // Print the expression that caused the constraint.
+        let Some(span) = constraint.get_span().to_range() else {
+            continue;
+        };
+        let content = &source[span];
+        let result = constraint.get_result();
+        output.push_str("\t{{\n\t\tline: ");
+        output.push_str(content);
+        output.push_str(",\n\t\result: [\n");
+        let Some((last, results)) = result.split_last() else {
+            continue;
+        };
+        for interval in results {
+            output.push_str("\t\t\t\t");
+            output.push_str(interval.pretty_print().to_string().as_str());
+            output.push_str(",\n");
+        }
+        output.push_str("\t\t\t\t");
+        output.push_str(last.pretty_print().to_string().as_str());
+        output.push_str("\n\t\t\t]\n\t}}");
+        // json requires no trailing comma...
+        if constraints.peek().is_some() {
+            output.push_str(",\n");
+        } else {
+            output.push('\n');
+        }
+    }
+    output.extend(&['}', '\n']);
+    output
 }

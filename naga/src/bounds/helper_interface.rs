@@ -187,4 +187,3 @@ impl From<crate::Literal> for abc_helper::Term {
         }
     }
 }
-

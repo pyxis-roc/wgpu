@@ -9,7 +9,7 @@
     clippy::match_wildcard_for_single_variants
 )]
 
-///! This module contains the analyzer for computing the bounds information for all buffer accesses.
+//! This module contains the analyzer for computing the bounds information for all buffer accesses.
 use super::visitor::{
     EntryPointIndex, ExpressionVisitor, IntoMarkedKey, ModuleVisitorInfo, StatementPathPart,
     StatementVisitor,
@@ -31,18 +31,21 @@ use super::helper_interface::{self, HasName, HasType};
 
 use crate::bounds::visitor::MarkedExprKey;
 use crate::proc::ExpressionKind;
-use crate::LocalVariable;
+use crate::span::SpanProvider;
 use crate::{
     non_max_u32::NonMaxU32,
     valid::{GlobalUse, ModuleInfo},
     AddressSpace, ArraySize, FastHashMap, FastHashSet, FunctionArgument, GlobalVariable, Module,
     Statement,
 };
+use crate::{Literal, LocalVariable, Span};
 use abc_helper::{
-    self, AbcExpression, AbcScalar, AbcType, ConstraintInterface, Predicate, StructField, Term,
+    self, AbcExpression, AbcScalar, AbcType, ConstraintId, ConstraintInterface, IntervalKind,
+    Predicate, StructField, Term, SummaryId,
 };
 
 use log::{info as log_info, trace as log_trace};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Convenience struct used to pass around a module with its info together in one term.
@@ -52,8 +55,9 @@ struct ModuleWithInfo<'a> {
     validation_info: &'a ModuleInfo,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum FnKey {
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FnKey {
     Function(crate::Handle<crate::Function>),
     EntryPoint(EntryPointIndex),
 }
@@ -144,6 +148,20 @@ macro_rules! get_ref {
             .expect("Block context should be populated before visiting expressions")
     };
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Marker {
+    fn_idx: FnKey,
+    handle: crate::Handle<crate::Expression>,
+}
+
+impl Marker {
+    #[inline]
+    #[must_use]
+    pub const fn new(fn_idx: FnKey, handle: crate::Handle<crate::Expression>) -> Self {
+        Self { fn_idx, handle }
+    }
+}
 /// The bounds checker acts acts as the Bridge between a [`Module`] and the Constraint Helper.
 ///
 /// This struct can be referenced, similarly to [`ModuleInfo`], to get the bounds requirements for the functions in the module.
@@ -158,6 +176,8 @@ macro_rules! get_ref {
 pub struct BoundsChecker<'module> {
     // Arena of vars we have...
     pub helper: abc_helper::ConstraintHelper,
+    /// Map from constraint IDs to the Marker for the expression they correspond to.
+    pub constraints: FastHashMap<u32, Marker>,
 
     pub global_vars: Vec<Term>,
     // Global expressions for the main module...
@@ -201,7 +221,90 @@ pub struct BoundsChecker<'module> {
     address_space_config: AddressSpacesToCheck,
 }
 
+pub struct BoundsCheckResult {
+    /// The function / entry point this result is for
+    fn_idx: FnKey,
+    /// The handle to the expression
+    handle: crate::Handle<crate::Expression>,
+
+    span: Span,
+    /// Whether the check can be eliminated.
+    ///
+    /// This is the interval kind that the check resolved to.
+    result: Vec<IntervalKind>,
+}
+
+impl BoundsCheckResult {
+    /// Get the span of the expression that this result is for.
+    #[must_use]
+    #[inline]
+    pub fn get_span(&self) -> Span {
+        self.span
+    }
+
+    /// Get the function / entry point index that this result is for.
+    #[must_use]
+    #[inline]
+    pub fn get_fn_idx(&self) -> FnKey {
+        self.fn_idx
+    }
+
+    /// Get the handle to the expression that this result is for.
+    #[must_use]
+    #[inline]
+    pub fn get_handle(&self) -> crate::Handle<crate::Expression> {
+        self.handle
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get_result(&self) -> &Vec<IntervalKind> {
+        &self.result
+    }
+}
+
 impl BoundsChecker<'_> {
+    /// Solves the bounds checks for the entry point and returns a report of the resulting formula.
+    ///
+    /// # Panics
+    /// Panics if there are no entry points.
+    pub fn make_report(&self) -> Result<Vec<BoundsCheckResult>, BoundsCheckError> {
+        // Resolve the constraints...
+        let index = self.entry_points.first().unwrap().id;
+        let solution = self.helper.solve(index)?;
+        let module = &self.module_info.unwrap();
+
+        let mut results = Vec::with_capacity(solution.len());
+
+        for constraint_id in self.constraints.keys() {
+            log_info!("Constraint ID: {constraint_id}");
+        }
+
+        log_info!("===========================");
+        for (constraint_id, result) in solution {
+            log_info!("Constraint ID: {constraint_id}");
+            // Get the span for the expression.
+            let marker = self.constraints.get(&constraint_id).unwrap();
+            let span = match marker.fn_idx {
+                FnKey::Function(f) => module.module.functions[f]
+                    .expressions
+                    .get_span(marker.handle),
+                FnKey::EntryPoint(EntryPointIndex(e)) => module.module.entry_points[e]
+                    .function
+                    .expressions
+                    .get_span(marker.handle),
+            };
+            results.push(BoundsCheckResult {
+                fn_idx: marker.fn_idx,
+                handle: marker.handle,
+                span,
+                result,
+            });
+        }
+
+        Ok(results)
+    }
+
     pub fn new(address_space_config: AddressSpacesToCheck) -> Self {
         Self {
             address_space_config,
@@ -296,14 +399,14 @@ struct PartialFunctionSummary {
 impl PartialFunctionSummary {
     fn into_function_summary(
         self,
-        handle: ConstraintHandle<abc_helper::Summary>,
+        id: SummaryId
     ) -> FunctionSummary {
         FunctionSummary {
             expressions: self.expressions,
             arguments: self.arguments,
             local_variabes: self.local_variabes,
-            handle,
             ret_ty: self.ret_ty,
+            id,
         }
     }
 }
@@ -339,9 +442,10 @@ pub struct FunctionSummary {
     /// An arena containing the Terms that correspond to the local variables in the function.
     /// Indexed by the handle of the local variable.
     pub local_variabes: Vec<Term>,
-    /// The handle to the function's summary in the helper.
-    pub handle: ConstraintHandle<abc_helper::Summary>,
     pub ret_ty: ConstraintHandle<AbcType>,
+
+    /// The id assigned to this function in the helper object.
+    pub id: SummaryId,
 }
 
 impl ops::Index<crate::Handle<crate::Expression>> for FunctionSummary {
@@ -504,6 +608,7 @@ impl<'module> BoundsChecker<'module> {
                 self.next_var_name(&name)
             }
         };
+        log::trace!("Marking type of {varname}");
         let var = self
             .helper
             .declare_var(abc_helper::Var { name: varname })
@@ -548,6 +653,13 @@ impl<'module> BoundsChecker<'module> {
     ///
     /// Used by [`visit_expr`]'s handling of [`AccessIndex`] and [`Access`].
     ///
+    /// # Arguments
+    /// * `base_expr_handle` - The expression handle to the **base** of the access. For `A[b]`, this would be the handle to `A`
+    /// * `base_expr` - The `Term` corresponding to the base base expression.
+    /// * `index` - The index expression, which may be either a `Literal` or a `Term`
+    /// * `with_constraints` - Whether or not to add constraints for this access.
+    /// * `access_expr_handle` - The handle to the entire access expression. This would be the handle to the entire `A[b]`
+    ///
     /// [`visit_expr`]: Self::visit_expr
     /// [`Access`]: crate::Expression::Access
     /// [`AccessIndex`]: crate::Expression::AccessIndex
@@ -557,6 +669,8 @@ impl<'module> BoundsChecker<'module> {
         base_expr: Term,
         index: ExpressionOrLiteral,
         with_constraints: bool, // Give me the source code for the expression...
+        // The expression that is being accessed.
+        access_expr_handle: crate::Handle<crate::Expression>,
     ) -> Result<Term, BoundsCheckError> {
         let func_ctx = self.get_current_function();
         let module_info = self.module_info.as_ref().unwrap();
@@ -587,27 +701,30 @@ impl<'module> BoundsChecker<'module> {
                 }
             };
         }
-
+        let marker = Marker::new(func_ctx.key, access_expr_handle);
         match *abc_ty.as_ref() {
+            // Whenever we add constraints, we need to mark the expression the constraint was for.
             AbcType::SizedArray { size, .. } => {
                 // Add the constraint that the index is less than the size
                 let index_literal: Term = as_expression!(index);
                 // Note: We can optimize this later on by reusing the same literal for 0.
                 if with_constraints {
+                    let id = self.constraints.len() as u32;
                     let size_literal: Term = Term::new_literal(size);
-                    self.helper.add_tracked_constraint(
+                    self.helper.add_constraint(
                         &index_literal,
                         abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
                         &size_literal,
-                        // The expression this comes from...
-                        abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
+                        id, // The expression this comes from...
                     )?;
-                    self.helper.add_tracked_constraint(
+                    self.constraints.insert(id, marker);
+                    self.helper.add_constraint(
                         &index_literal,
                         abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
-                        &Term::new_literal(0),
-                        abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
+                        &Term::new_literal(0u32),
+                        id + 1,
                     )?;
+                    self.constraints.insert(id + 1, marker);
                 }
                 // Make a new expression that is an access to the base and the index.
                 Ok(Term::new_index_access(&base_expr, &index_literal))
@@ -616,21 +733,24 @@ impl<'module> BoundsChecker<'module> {
                 let index_literal: Term = as_expression!(index);
                 let res = Term::new_index_access(&base_expr, &index_literal);
                 if with_constraints {
-                    self.helper.add_tracked_constraint(
+                    let id = self.constraints.len() as u32;
+                    self.helper.add_constraint(
                         &index_literal,
                         abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Geq),
-                        &Term::new_literal(0),
-                        abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
+                        &Term::new_literal(0u32),
+                        id,
                     )?;
+                    self.constraints.insert(id, marker);
                     // We need an expression for the array length..
                     let len_expression = Term::make_array_length(&base_expr);
-                    self.helper.add_tracked_constraint(
+                    let constraint_id = self.helper.add_constraint(
                         &index_literal,
                         abc_helper::ConstraintOp::Cmp(abc_helper::CmpOp::Lt),
                         // todo: fix this.
                         &len_expression,
-                        abc_helper::OpaqueMarker::new(&format!("{}[{}]", base_expr, index)),
+                        id + 1,
                     )?;
+                    self.constraints.insert(id + 1, marker);
                 }
                 Ok(res)
             }
@@ -654,6 +774,7 @@ impl<'module> BoundsChecker<'module> {
                             }
                         },
                         abc_ty.clone(),
+                        l as usize,
                     ))
                 } else {
                     Err(BoundsCheckError::Unsupported(
@@ -801,7 +922,13 @@ impl<'module> BoundsChecker<'module> {
                     .is_indexable(module_info.module, self.buffer_config)
                 {
                     let base_expr = self.visit_expr(base)?;
-                    self.make_access(base, base_expr, ExpressionOrLiteral::Literal(index), true)?;
+                    self.make_access(
+                        base,
+                        base_expr,
+                        ExpressionOrLiteral::Literal(index),
+                        true,
+                        expr_handle,
+                    )?;
                 } else {
                     self.visit_expr_check_only(base)?;
                 }
@@ -827,6 +954,7 @@ impl<'module> BoundsChecker<'module> {
                         base_expr,
                         ExpressionOrLiteral::Expression(idx_expr),
                         true,
+                        expr_handle,
                     )?;
                 } else {
                     self.visit_expr_check_only(base)?;
@@ -869,6 +997,8 @@ impl<'module> BoundsChecker<'module> {
         // Now we mark the type of this expression we just got
         // When we load an expression, we
         use crate::Expression as Expr;
+
+        let mut is_plain_var = false;
 
         let resolved: Term = match self
             .current_fn_info
@@ -923,10 +1053,14 @@ impl<'module> BoundsChecker<'module> {
             // Although, for 'store', this really needs to mark the current variable name...
             // A 'load' should get the most recent variable name of the expression it is loading from...
             Expr::Load { pointer } => self.visit_expr(pointer)?,
-            Expr::Literal(lit) => lit.into(),
+            Expr::Literal(lit) => {
+                is_plain_var = true;
+                lit.into()
+            }
             Expr::Constant(c) => self[c].clone(),
             Expr::Override(o) => self[o].clone(),
             Expr::FunctionArgument(idx) => {
+                is_plain_var = true;
                 get_ref!(@func_summary, self).arguments[idx as usize].clone()
             }
             Expr::Binary { op, left, right } => {
@@ -935,6 +1069,7 @@ impl<'module> BoundsChecker<'module> {
                 Self::binary_to_abc_expression(op, left, right)?
             }
             Expr::Access { base, index, .. } => {
+                is_plain_var = true;
                 let new_base = self.visit_expr(base)?;
                 let new_index = self.visit_expr(index)?;
                 self.make_access(
@@ -942,17 +1077,20 @@ impl<'module> BoundsChecker<'module> {
                     new_base,
                     ExpressionOrLiteral::Expression(new_index),
                     needs_checked,
+                    expr_handle,
                 )?
             }
             // We should mark the type of the pointer
             // Expr::FunctionArgument(idx) => func_ctx.arguments[*idx as usize].clone(),
             Expr::AccessIndex { base, index } => {
+                is_plain_var = true;
                 let new_base = self.visit_expr(base)?;
                 self.make_access(
                     base,
                     new_base,
                     ExpressionOrLiteral::Literal(index),
                     needs_checked,
+                    expr_handle,
                 )?
             }
             Expr::As {
@@ -982,6 +1120,7 @@ impl<'module> BoundsChecker<'module> {
                 }
             }
             Expr::GlobalVariable(ref g) => {
+                is_plain_var = true;
                 // If the term exists in our global variable map, then we use that.
                 if let Some(&(ref term, _)) = get_ref!(@block_ctx, self).global_variable_map.get(g)
                 {
@@ -991,6 +1130,7 @@ impl<'module> BoundsChecker<'module> {
                 }
             }
             Expr::LocalVariable(ref l) => {
+                is_plain_var = true;
                 get_ref!(@block_ctx, self).local_variable_map[l].0.clone()
             }
             Expr::CallResult(ref c) => {
@@ -1019,7 +1159,10 @@ impl<'module> BoundsChecker<'module> {
                 // Now, figure out how many terms so we know how many to loop over.
                 let module_info = get_ref!(@module_info, self);
                 let num_elems = self
-                    .get_num_elems(module_info.module, &get_ref!(@func_ctx, self).info[argument].ty)
+                    .get_num_elems(
+                        module_info.module,
+                        &get_ref!(@func_ctx, self).info[argument].ty,
+                    )
                     .ok_or(BoundsCheckError::Unexpected(
                         "Could not get number of elements for relational argument".to_string(),
                     ))?;
@@ -1076,11 +1219,23 @@ impl<'module> BoundsChecker<'module> {
                         let arg1 = self.visit_expr(unsafe { arg1.unwrap_unchecked() })?;
                         Term::new_dot(&arg, &arg1)
                     }
+                    // For other math methods, we respond with some dummy value that we don't track.
                     _ => {
-                        return Err(BoundsCheckError::Unsupported(format!(
-                            "Unsupported math function used for value: {:?}",
-                            fun
-                        )));
+                        // For the rest of these, all we do is check if they contain index accesses.
+                        // So we just do checks on the rest.
+                        self.visit_expr_check_only(arg)?;
+                        if let Some(arg1) = arg1 {
+                            self.visit_expr_check_only(arg1)?;
+                        }
+                        if let Some(arg2) = arg2 {
+                            self.visit_expr_check_only(arg2)?;
+                        }
+                        if let Some(arg3) = arg3 {
+                            self.visit_expr_check_only(arg3)?;
+                        }
+                        // We still need to return a value, so we just return a dummy value here.
+                        // We will have no knowledge about this value.
+                        Term::new_var(self.next_var_name("UNSUPPORTED_MATH_RESULT"))
                     }
                 }
             }
@@ -1091,22 +1246,24 @@ impl<'module> BoundsChecker<'module> {
             }
         };
 
-        // If this is a named expression, then we use the name to refer to said expression.
-        // Otherwise, the result is the term we evaluated.
-        let resolved = if let Some(named_expression) = self
+        // If this is a named expression that is not just a renaming of a variable, then we use its name.
+        let maybe_named = self
             .get_current_function()
             .func
             .named_expressions
             .get(&expr_handle)
-            .cloned()
-        {
+            .cloned();
+
+        // Use the name of the expression if it is named, and it isn't just a renaming of a variable.
+        let resolved = if !is_plain_var && maybe_named.is_some() {
+            let named_expression = maybe_named.unwrap();
             let varname = self.next_var_name(named_expression.as_str());
             let expr_var_name = self.helper.declare_var(abc_helper::Var { name: varname })?;
 
             // Add the equality constraint.
-            self.helper.add_constraint(
+            self.helper.add_assumption(
                 &expr_var_name,
-                abc_helper::ConstraintOp::Assign,
+                abc_helper::AssumptionOp::Assign,
                 &resolved,
             )?;
 
@@ -1218,7 +1375,7 @@ impl<'module> BoundsChecker<'module> {
             };
             // Add the assumption that the new term is equal to the value of the variable.
             self.helper
-                .add_assumption(&new_var, abc_helper::ConstraintOp::Assign, &new_term)?;
+                .add_assumption(&new_var, abc_helper::AssumptionOp::Assign, &new_term)?;
         }
         Ok(())
     }
@@ -1315,7 +1472,7 @@ impl<'module> BoundsChecker<'module> {
                 let init_term = self.visit_expr(init)?;
                 self.helper.add_assumption(
                     &var_term,
-                    abc_helper::ConstraintOp::Assign,
+                    abc_helper::AssumptionOp::Assign,
                     &init_term,
                 )?;
             } else {
@@ -1328,7 +1485,7 @@ impl<'module> BoundsChecker<'module> {
                         use crate::Scalar;
                         self.helper.add_assumption(
                             &var_term,
-                            abc_helper::ConstraintOp::Assign,
+                            abc_helper::AssumptionOp::Assign,
                             &match s {
                                 Scalar::BOOL => Term::new_literal_false(),
                                 Scalar::I32 => Term::new_literal(abc_helper::Literal::I32(0i32)),
@@ -1575,7 +1732,7 @@ impl<'module> BoundsChecker<'module> {
 
             // Mark the constraint of the initialization.
             self.helper
-                .add_constraint(&cnst, abc_helper::ConstraintOp::Assign, &expr)?;
+                .add_assumption(&cnst, abc_helper::AssumptionOp::Assign, &expr)?;
         }
         self.overrides = Vec::with_capacity(module.overrides.len());
         for (var_handle, var) in module.overrides.iter() {
@@ -1590,7 +1747,7 @@ impl<'module> BoundsChecker<'module> {
             if let Some(init) = var.init {
                 let expr = self.global_expression_resolution(init, &module_info)?;
                 self.helper
-                    .add_constraint(&new_var, abc_helper::ConstraintOp::Assign, &expr)?;
+                    .add_assumption(&new_var, abc_helper::AssumptionOp::Assign, &expr)?;
             }
         }
 
@@ -1627,12 +1784,12 @@ impl<'module> BoundsChecker<'module> {
             // Now begin the common function handling logic
             self.check_function(&func_name)?;
             self.current_fn_info = None;
-            let summary_handle = self.helper.end_summary()?;
+            let id = self.helper.end_summary()?;
             self.functions.push(
                 self.current_fn_summary
                     .take()
                     .unwrap()
-                    .into_function_summary(summary_handle),
+                    .into_function_summary(id),
             );
             self.pop_path_part();
         }
@@ -1650,13 +1807,14 @@ impl<'module> BoundsChecker<'module> {
 
             self.current_fn_info = Some(FunctionWithInfo {
                 func: &ep.function,
-                info: &validation_info.get_entry_point(pos),
+                info: validation_info.get_entry_point(pos),
                 key: FnKey::EntryPoint(pos.into()),
             });
 
             self.current_fn_summary = Some(partial_summary);
 
             for (pos, arg) in ep.function.arguments.iter().enumerate() {
+                log::trace!("Adding information for argument: {arg:?}");
                 let var = self.make_arg(arg, &ep.function, pos)?;
                 // This arg *must* be a bound.
                 use crate::Binding;
@@ -1690,13 +1848,13 @@ impl<'module> BoundsChecker<'module> {
 
             self.check_function(&func_name)?;
 
-            let summary_handle = self.helper.end_summary()?;
+            let summary_id = self.helper.end_summary()?;
             // End the summary
             self.entry_points.push(
                 self.current_fn_summary
                     .take()
                     .unwrap()
-                    .into_function_summary(summary_handle),
+                    .into_function_summary(summary_id),
             );
 
             self.pop_path_part();
@@ -1882,7 +2040,7 @@ impl StatementVisitor<BoundsCheckError> for BoundsChecker<'_> {
                     )?;
                     self.helper.add_assumption(
                         &new_term,
-                        abc_helper::ConstraintOp::Assign,
+                        abc_helper::AssumptionOp::Assign,
                         &value_term,
                     )?;
                     let Some(ref mut block_ctx) = self.current_block_ctx else {
@@ -1897,7 +2055,7 @@ impl StatementVisitor<BoundsCheckError> for BoundsChecker<'_> {
                         .mark_var(&get_ref!(@module_info).module.global_variables[g], "global")?;
                     self.helper.add_assumption(
                         &new_term,
-                        abc_helper::ConstraintOp::Assign,
+                        abc_helper::AssumptionOp::Assign,
                         &value_term,
                     )?;
                     let Some(ref mut block_ctx) = self.current_block_ctx else {
@@ -2061,7 +2219,7 @@ impl StatementVisitor<BoundsCheckError> for BoundsChecker<'_> {
                 .ok_or(BoundsCheckError::Unexpected(
                     "Reference to a function that has not been declared.".to_string(),
                 ))?;
-        let handle = called_func.handle.clone();
+        let id = called_func.id;
         // Using collect looks cleaner, but it's slower since we know the capacity of the vector.
         let mut args = Vec::with_capacity(arguments.len());
         for &arg in arguments {
@@ -2093,10 +2251,10 @@ impl StatementVisitor<BoundsCheckError> for BoundsChecker<'_> {
             };
             func_summary
                 .expressions
-                .insert(result, self.helper.make_call(&handle, args, Some(&var))?);
+                .insert(result, self.helper.make_call(id, args, Some(&var))?);
         } else {
             // If there is no result, we just make the call.
-            self.helper.make_call(&handle, args, None)?;
+            self.helper.make_call(id, args, None)?;
         };
 
         Ok(())
@@ -2283,8 +2441,6 @@ impl StatementVisitor<BoundsCheckError> for BoundsChecker<'_> {
 
     /// This visitor has nothing to do for barriers.
     fn visit_Barrier(&mut self, barrier: crate::Barrier) -> Result<(), BoundsCheckError> {
-        // For barriers, we don't need to do anything.
-        // We aren't a race checker.
         Ok(())
     }
 }
@@ -2522,9 +2678,6 @@ impl BoundsChecker<'_> {
 
             self.helper.begin_loop(&loop_cond_term)?;
 
-            // Now, iterate through the rest of body.
-            // First, though, get a snapshot of the block context.
-            // Okay, we take the old ctx out of the current block ctx.
             let mut old_ctx = self
                 .current_block_ctx
                 .take()
@@ -2583,9 +2736,6 @@ impl BoundsChecker<'_> {
             )?;
             self.current_block_ctx = Some(old_ctx);
 
-            // Now, after the loop, I have to mark each variable that was updated..
-            // Now we have to unify the block context..
-            // Though if the loop variable was written to, then this is an unsupported loop
             Ok(())
         } else {
             Err(BoundsCheckError::UnsupportedLoopStructure)
