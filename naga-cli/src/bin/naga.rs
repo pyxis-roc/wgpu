@@ -2,7 +2,13 @@
 use anyhow::{anyhow, Context as _};
 #[allow(unused_imports)]
 use std::fs;
-use std::{error::Error, fmt, io::Read, path::Path, str::FromStr};
+use std::{
+    error::Error,
+    fmt,
+    io::{Read, Write},
+    path::Path,
+    str::FromStr,
+};
 
 /// Translate shaders to different formats.
 #[derive(argh::FromArgs, Debug, Clone)]
@@ -82,6 +88,10 @@ struct Args {
     /// in abc constraint output, write as json instead of text.
     #[argh(switch)]
     abc_json: bool,
+
+    /// in abc output, write the solved constraints instead of just reporting them
+    #[argh(switch)]
+    abc_report: bool,
 
     /// specify file path to process STDIN as
     #[argh(option)]
@@ -324,6 +334,7 @@ struct Parameters<'a> {
     shader_stage: Option<ShaderStage>,
     defines: FastHashMap<String, String>,
     abc_json: bool,
+    abc_report: bool,
 }
 
 trait PrettyResult {
@@ -446,6 +457,7 @@ fn run() -> anyhow::Result<()> {
 
     params.dot.cfg_only = args.dot_cfg_only;
     params.abc_json = args.abc_json;
+    params.abc_report = args.abc_report;
 
     params.spv_out.bounds_check_policies = params.bounds_check_policies;
     params.spv_out.flags.set(
@@ -541,7 +553,7 @@ fn run() -> anyhow::Result<()> {
         if info.is_some() {
             // Write out the module state before compaction, if requested.
             if let Some(ref before_compaction) = args.before_compaction {
-                write_output(&module, &info, &params, before_compaction)?;
+                write_output(&module, &info, &params, before_compaction, &None)?;
             }
 
             naga::compact::compact(&mut module);
@@ -585,7 +597,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     for output_path in output_paths {
-        write_output(&module, &info, &params, output_path)?;
+        write_output(&module, &info, &params, output_path, &input_text)?;
     }
 
     Ok(())
@@ -687,16 +699,20 @@ fn write_output(
     info: &Option<naga::valid::ModuleInfo>,
     params: &Parameters,
     output_path: &str,
+    input_text: &Option<String>,
 ) -> anyhow::Result<()> {
-    match Path::new(&output_path)
-        .extension()
-        .ok_or(CliError("Output filename has no extension"))?
-        .to_str()
-        .ok_or(CliError("Output filename not valid unicode"))?
-    {
-        "txt" => {
-            use std::io::Write;
+    let extension = if params.abc_json || params.abc_report {
+        "abc"
+    } else {
+        Path::new(&output_path)
+            .extension()
+            .ok_or(CliError("Output filename has no extension"))?
+            .to_str()
+            .ok_or(CliError("Output filename not valid unicode"))?
+    };
 
+    match extension {
+        "txt" => {
             let mut file = fs::File::create(output_path)?;
             writeln!(file, "{module:#?}")?;
             if let Some(ref info) = *info {
@@ -845,12 +861,27 @@ fn write_output(
             fs::write(output_path, wgsl)?;
         }
         "abc" => {
-            use naga::bounds::BoundsChecker;
+            use naga::bounds::{report_to_json, BoundsChecker};
             if let Some(info) = info {
                 let mut b = BoundsChecker::new(Default::default());
                 // TODO: add a way to configure the address spaces to check
                 if let Err(e) = b.abc_impl(module, info) {
                     eprintln!("Bounds checking failed: {e}. Not writing to file.");
+                } else if params.abc_report {
+                    let Some(input_text) = input_text else {
+                        return Err(CliError(
+                            "Input source must exist when creating an abc_report",
+                        ))?;
+                    };
+                    // If this has an entry point, then solve that.
+                    if b.entry_points.len() != 1 {
+                        Err(CliError("Expected exactly one entry point"))?;
+                    }
+                    let mut file = fs::File::create(output_path)?;
+
+                    let report = b.make_report()?;
+                    let json = report_to_json(&report, &input_text);
+                    file.write(json.as_bytes())?;
                 } else {
                     // Serialize the file to json.
                     let mut file = fs::File::create(output_path)?;
